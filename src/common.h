@@ -32,6 +32,7 @@ enum class ElementRole : std::uint8_t {
 
 struct ElementInfo {
     std::uint64_t id = 0;
+    HWND ownerWindow = nullptr;
     RECT bounds{};
     ElementRole role = ElementRole::Action;
     std::uint64_t sectionId = 0;

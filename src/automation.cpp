@@ -1,6 +1,7 @@
 #include "automation.h"
 
 #include "com_ptr.h"
+#include "text_role.h"
 
 #include <UIAutomation.h>
 #include <dwmapi.h>
@@ -43,6 +44,7 @@ struct SectionCandidate {
 
 struct StoredElement {
     ElementRole role = ElementRole::Action;
+    RECT bounds{};
     ComPtr<IUIAutomationElement> automationElement;
 };
 
@@ -63,6 +65,7 @@ struct AutomationState {
     ComPtr<IUIAutomationTextRange> documentRange;
     ComPtr<IUIAutomationTextRange> anchorRange;
     ComPtr<IUIAutomationTextRange> caretRange;
+    RECT caretFallbackBounds{};
 };
 
 bool IsTaskbarWindow(HWND window) {
@@ -237,31 +240,19 @@ std::optional<bool> TextRangeReportsEditable(IUIAutomationElement* element, bool
 ElementRole ClassifyElement(
     CONTROLTYPEID type,
     bool hasTextPattern,
-    bool hasTextEditPattern,
     bool hasValuePattern,
     bool valueReadOnly,
     std::optional<bool> textRangeEditable,
     bool isPassword,
     bool hasInvokePattern) {
-    if (type == UIA_EditControlTypeId) {
-        if (hasValuePattern) {
-            return valueReadOnly ? ElementRole::ReadOnlyText : ElementRole::EditableText;
-        }
-        if (textRangeEditable.has_value()) {
-            return *textRangeEditable ? ElementRole::EditableText : ElementRole::ReadOnlyText;
-        }
-        return ElementRole::EditableText;
-    }
-    if (type == UIA_DocumentControlTypeId && hasTextPattern) {
-        return hasTextEditPattern || (hasValuePattern && !valueReadOnly) || textRangeEditable.value_or(false)
-            ? ElementRole::EditableText
-            : ElementRole::ReadOnlyText;
-    }
-    if (!isPassword && hasTextPattern && (type == UIA_TextControlTypeId || type == UIA_CustomControlTypeId)) {
-        if (textRangeEditable.has_value()) {
-            return *textRangeEditable ? ElementRole::EditableText : ElementRole::ReadOnlyText;
-        }
-        return hasTextEditPattern ? ElementRole::EditableText : ElementRole::ReadOnlyText;
+    if (const auto textRole = ClassifyTextRole(
+            type,
+            hasTextPattern,
+            hasValuePattern,
+            valueReadOnly,
+            textRangeEditable,
+            isPassword)) {
+        return *textRole;
     }
     if (IsActionControl(type, hasInvokePattern)) return ElementRole::Action;
     return static_cast<ElementRole>(255);
@@ -296,7 +287,7 @@ bool ConfigureCache(AutomationState& state) {
     if (FAILED(state.automation->get_ControlViewCondition(state.controlViewCondition.Put()))) return false;
     if (FAILED(state.automation->CreateCacheRequest(state.cacheRequest.Put()))) return false;
 
-    const std::array<PROPERTYID, 12> properties{
+    const std::array<PROPERTYID, 11> properties{
         UIA_BoundingRectanglePropertyId,
         UIA_ControlTypePropertyId,
         UIA_IsEnabledPropertyId,
@@ -306,7 +297,6 @@ bool ConfigureCache(AutomationState& state) {
         UIA_NamePropertyId,
         UIA_IsInvokePatternAvailablePropertyId,
         UIA_IsTextPatternAvailablePropertyId,
-        UIA_IsTextEditPatternAvailablePropertyId,
         UIA_IsValuePatternAvailablePropertyId,
         UIA_ValueIsReadOnlyPropertyId,
     };
@@ -437,7 +427,6 @@ void CollectWindowElements(
         if (IsSectionControl(controlType)) sections.push_back({bounds, controlType});
 
         const bool hasTextPattern = VariantBool(element.Get(), UIA_IsTextPatternAvailablePropertyId);
-        const bool hasTextEditPattern = VariantBool(element.Get(), UIA_IsTextEditPatternAvailablePropertyId);
         const bool hasValuePattern = VariantBool(element.Get(), UIA_IsValuePatternAvailablePropertyId);
         const bool hasInvokePattern = VariantBool(element.Get(), UIA_IsInvokePatternAvailablePropertyId);
         const bool valueReadOnly = VariantBool(element.Get(), UIA_ValueIsReadOnlyPropertyId, true);
@@ -453,7 +442,6 @@ void CollectWindowElements(
         const ElementRole role = ClassifyElement(
             controlType,
             hasTextPattern,
-            hasTextEditPattern,
             hasValuePattern,
             valueReadOnly,
             textRangeEditable,
@@ -463,6 +451,7 @@ void CollectWindowElements(
         if (!ElementCenterIsVisible(bounds, windows, windowIndex)) continue;
 
         RawElement raw;
+        raw.info.ownerWindow = window.handle;
         raw.info.bounds = bounds;
         const auto windowArea = RectArea(window.bounds);
         raw.info.drawOutline = windowArea <= 0 ||
@@ -542,7 +531,9 @@ ScanResult* ScanDesktop(AutomationState& state, std::uint64_t generation) {
         const std::uint64_t id = state.nextElementId++;
         raw.info.id = id;
         result->elements.push_back(raw.info);
-        store.elements.emplace(id, StoredElement{raw.info.role, std::move(raw.automationElement)});
+        store.elements.emplace(
+            id,
+            StoredElement{raw.info.role, raw.info.bounds, std::move(raw.automationElement)});
     }
 
     state.generations.push_back(std::move(store));
@@ -679,6 +670,7 @@ void ClearCaret(AutomationState& state) {
     state.anchorRange.Reset();
     state.documentRange.Reset();
     state.caretElement.Reset();
+    state.caretFallbackBounds = {};
 }
 
 std::optional<RECT> CurrentCaretBounds(AutomationState& state) {
@@ -756,6 +748,17 @@ void PostCaretVisual(HWND replyWindow, AutomationState& state, bool visible) {
                     std::min(elementBounds.bottom - 2, top + 20),
                 };
             }
+        }
+        if (!result->visible && RectArea(state.caretFallbackBounds) > 0) {
+            const RECT& elementBounds = state.caretFallbackBounds;
+            result->visible = true;
+            const LONG top = elementBounds.top + std::min<LONG>(6, RectHeight(elementBounds) / 4);
+            result->bounds = RECT{
+                elementBounds.left + 7,
+                top,
+                elementBounds.left + 9,
+                std::min(elementBounds.bottom - 2, top + 20),
+            };
         }
     }
     if (!IsWindow(replyWindow) ||
@@ -843,6 +846,10 @@ ActivationResult* ActivateElement(
 
     ClearCaret(state);
     const HRESULT focusResult = stored->automationElement->SetFocus();
+    if (stored->role == ElementRole::ReadOnlyText) {
+        state.caretElement = stored->automationElement;
+        state.caretFallbackBounds = stored->bounds;
+    }
     ComPtr<IUIAutomationTextPattern> textPattern;
     const HRESULT patternResult = stored->automationElement->GetCurrentPatternAs(
         UIA_TextPatternId,
@@ -857,13 +864,11 @@ ActivationResult* ActivateElement(
         const HRESULT selectResult = start ? start->Select() : E_FAIL;
 
         if (stored->role == ElementRole::ReadOnlyText) {
-            state.caretElement = stored->automationElement;
             state.documentRange = std::move(document);
             state.anchorRange = CloneRange(start.Get());
             state.caretRange = std::move(start);
             result->mode = ActivationMode::Caret;
-            result->succeeded = state.caretRange && (SUCCEEDED(focusResult) || SUCCEEDED(selectResult));
-            if (!result->succeeded && state.caretRange) result->succeeded = true;
+            result->succeeded = true;
             return result;
         }
 
@@ -873,9 +878,13 @@ ActivationResult* ActivateElement(
         return result;
     }
 
-    result->mode = stored->role == ElementRole::EditableText
-        ? ActivationMode::Editable
-        : ActivationMode::Pointer;
+    if (stored->role == ElementRole::ReadOnlyText) {
+        result->mode = ActivationMode::Caret;
+        result->succeeded = true;
+        return result;
+    }
+
+    result->mode = ActivationMode::Editable;
     result->succeeded = SUCCEEDED(focusResult);
     if (result->mode == ActivationMode::Editable && result->succeeded) {
         PlaceEditableCaret(stored->automationElement.Get());

@@ -1,4 +1,5 @@
 #include "hints.h"
+#include "text_role.h"
 
 #include <cstdlib>
 #include <cstdint>
@@ -22,6 +23,19 @@ kbun::ElementInfo Element(std::uint64_t id, int x, int y, std::uint64_t section 
     result.bounds = RECT{x, y, x + 80, y + 24};
     result.sectionId = section;
     result.sectionBounds = RECT{0, 0, 500, 500};
+    return result;
+}
+
+kbun::ElementInfo SectionElement(
+    std::uint64_t id,
+    RECT bounds,
+    std::uint64_t section,
+    RECT sectionBounds) {
+    kbun::ElementInfo result;
+    result.id = id;
+    result.bounds = bounds;
+    result.sectionId = section;
+    result.sectionBounds = sectionBounds;
     return result;
 }
 
@@ -79,6 +93,73 @@ int main() {
         Check(inner.size() <= 26, "one-step group fits the single-letter alphabet");
         Check(std::ranges::none_of(inner, [](const auto& hint) { return hint.isGroup; }),
               "inner targets never create another nesting level");
+    }
+
+    {
+        std::vector<kbun::ElementInfo> elements;
+        const RECT outerBounds{0, 0, 700, 500};
+        const RECT innerBounds{300, 100, 620, 380};
+        for (std::uint64_t id = 1; id <= 5; ++id) {
+            elements.push_back(SectionElement(
+                id,
+                RECT{20, static_cast<LONG>(id * 40), 140, static_cast<LONG>(id * 40 + 28)},
+                10,
+                outerBounds));
+            elements.push_back(SectionElement(
+                id + 10,
+                RECT{330, static_cast<LONG>(id * 40 + 80), 450, static_cast<LONG>(id * 40 + 108)},
+                20,
+                innerBounds));
+        }
+
+        kbun::HintNavigator hints;
+        hints.Reset(12, std::move(elements));
+        const auto top = hints.Display();
+        Check(std::ranges::count_if(top, [](const auto& hint) { return hint.isGroup; }) == 1,
+              "only the smaller overlapping section remains nested");
+        Check(std::ranges::count_if(top, [](const auto& hint) { return !hint.isGroup; }) == 5,
+              "the larger overlapping section is flattened to direct targets");
+    }
+
+    {
+        std::vector<kbun::ElementInfo> elements;
+        elements.push_back(SectionElement(1, RECT{0, 0, 320, 80}, 0, {}));
+        elements.push_back(SectionElement(2, RECT{250, 10, 305, 45}, 0, {}));
+        elements.push_back(SectionElement(3, RECT{250, 45, 305, 75}, 0, {}));
+
+        kbun::HintNavigator hints;
+        hints.Reset(13, std::move(elements));
+        const auto top = hints.Display();
+        Check(top.size() == 1 && top.front().isGroup,
+              "an overlapping parent and its controls share one top-level hint");
+        Check(hints.Input(top.front().code[0]).type == kbun::HintOutcome::Type::Changed,
+              "the overlap group opens in one step");
+        const auto inner = hints.Display();
+        Check(inner.size() == 3, "the parent action and both child controls stay reachable");
+        Check(std::ranges::count_if(inner, [](const auto& hint) { return hint.drawOutline; }) == 2,
+              "the larger inner wrapper drops only its conflicting outline");
+    }
+
+    {
+        const auto codexDocument = kbun::ClassifyTextRole(
+            UIA_DocumentControlTypeId,
+            true,
+            false,
+            true,
+            std::nullopt,
+            false);
+        Check(codexDocument == kbun::ElementRole::ReadOnlyText,
+              "a mixed document without explicit editability uses caret browsing");
+
+        const auto editableDocument = kbun::ClassifyTextRole(
+            UIA_DocumentControlTypeId,
+            true,
+            false,
+            true,
+            true,
+            false);
+        Check(editableDocument == kbun::ElementRole::EditableText,
+              "range-level editability still identifies editable documents");
     }
 
     std::cout << "KBUN hint tests passed\n";
