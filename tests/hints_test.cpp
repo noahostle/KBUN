@@ -71,12 +71,14 @@ int main() {
         kbun::HintNavigator hints;
         hints.Reset(11, std::move(elements));
         const auto top = hints.Display();
-        Check(top.size() == 1 && top.front().isGroup, "large section remains one top-level group");
+        Check(top.size() == 3, "large section is split into top-level one-step groups");
+        Check(std::ranges::all_of(top, [](const auto& hint) { return hint.isGroup; }),
+              "large-section chunks are top-level groups");
         hints.Input(top.front().code[0]);
-        const auto partitions = hints.Display();
-        Check(partitions.size() <= 26, "large section partitions fit the one-letter alphabet");
-        Check(std::ranges::all_of(partitions, [](const auto& hint) { return hint.isGroup; }),
-              "large-section first level contains subgroups");
+        const auto inner = hints.Display();
+        Check(inner.size() <= 26, "one-step group fits the single-letter alphabet");
+        Check(std::ranges::none_of(inner, [](const auto& hint) { return hint.isGroup; }),
+              "inner targets never create another nesting level");
     }
 
     std::cout << "KBUN hint tests passed\n";

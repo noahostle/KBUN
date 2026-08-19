@@ -16,6 +16,7 @@ struct DisplayHint {
     ElementRole role = ElementRole::Action;
     bool isGroup = false;
     bool prefixMatch = true;
+    bool drawOutline = true;
 };
 
 struct HintOutcome {
@@ -48,6 +49,7 @@ private:
         std::vector<std::size_t> members;
         RECT bounds{};
         std::wstring code;
+        bool drawOutline = true;
     };
 
     struct Scope {
@@ -67,4 +69,3 @@ private:
 };
 
 }  // namespace kbun
-

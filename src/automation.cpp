@@ -83,7 +83,9 @@ bool IsWindowCandidate(HWND window, DWORD ownProcessId, RECT& bounds) {
     if (processId == ownProcessId) {
         wchar_t className[128]{};
         GetClassNameW(window, className, static_cast<int>(std::size(className)));
-        if (std::wcscmp(className, L"KBUN.Overlay") == 0 || std::wcscmp(className, L"KBUN.App") == 0) {
+        if (std::wcscmp(className, L"KBUN.Overlay") == 0 ||
+            std::wcscmp(className, L"KBUN.Caret") == 0 ||
+            std::wcscmp(className, L"KBUN.App") == 0) {
             return false;
         }
     }
@@ -129,23 +131,12 @@ bool PointIsUnoccluded(
     return true;
 }
 
-bool ElementHasVisibleSample(
+bool ElementCenterIsVisible(
     const RECT& bounds,
     const std::vector<WindowCandidate>& windows,
     std::size_t ownerIndex) {
     if (RectArea(bounds) <= 0) return false;
-    const LONG insetX = std::min<LONG>(4, std::max<LONG>(0, RectWidth(bounds) / 4));
-    const LONG insetY = std::min<LONG>(4, std::max<LONG>(0, RectHeight(bounds) / 4));
-    const std::array<POINT, 5> samples{
-        RectCenter(bounds),
-        POINT{bounds.left + insetX, bounds.top + insetY},
-        POINT{bounds.right - 1 - insetX, bounds.top + insetY},
-        POINT{bounds.left + insetX, bounds.bottom - 1 - insetY},
-        POINT{bounds.right - 1 - insetX, bounds.bottom - 1 - insetY},
-    };
-    return std::ranges::any_of(samples, [&windows, ownerIndex](POINT point) {
-        return PointIsUnoccluded(point, windows, ownerIndex);
-    });
+    return PointIsUnoccluded(RectCenter(bounds), windows, ownerIndex);
 }
 
 bool WindowHasVisibleRegion(const std::vector<WindowCandidate>& windows, std::size_t ownerIndex) {
@@ -219,27 +210,26 @@ bool IsSectionControl(CONTROLTYPEID type) {
     }
 }
 
-bool IsStrongSectionControl(CONTROLTYPEID type) {
-    return type != UIA_PaneControlTypeId;
-}
-
-bool TextRangeReportsEditable(IUIAutomationElement* element, bool hasTextPattern) {
-    if (!hasTextPattern) return false;
+std::optional<bool> TextRangeReportsEditable(IUIAutomationElement* element, bool hasTextPattern) {
+    if (!hasTextPattern) return std::nullopt;
     ComPtr<IUIAutomationTextPattern> pattern;
     if (FAILED(element->GetCurrentPatternAs(
             UIA_TextPatternId,
             IID_IUIAutomationTextPattern,
             pattern.PutVoid())) ||
         !pattern) {
-        return false;
+        return std::nullopt;
     }
     ComPtr<IUIAutomationTextRange> document;
-    if (FAILED(pattern->get_DocumentRange(document.Put())) || !document) return false;
+    if (FAILED(pattern->get_DocumentRange(document.Put())) || !document) return std::nullopt;
 
     VARIANT readOnly;
     VariantInit(&readOnly);
     const HRESULT result = document->GetAttributeValue(UIA_IsReadOnlyAttributeId, &readOnly);
-    const bool editable = SUCCEEDED(result) && readOnly.vt == VT_BOOL && readOnly.boolVal == VARIANT_FALSE;
+    std::optional<bool> editable;
+    if (SUCCEEDED(result) && readOnly.vt == VT_BOOL) {
+        editable = readOnly.boolVal == VARIANT_FALSE;
+    }
     VariantClear(&readOnly);
     return editable;
 }
@@ -250,20 +240,27 @@ ElementRole ClassifyElement(
     bool hasTextEditPattern,
     bool hasValuePattern,
     bool valueReadOnly,
-    bool textRangeEditable,
+    std::optional<bool> textRangeEditable,
     bool isPassword,
     bool hasInvokePattern) {
     if (type == UIA_EditControlTypeId) {
-        return hasValuePattern && valueReadOnly
-            ? ElementRole::ReadOnlyText
-            : ElementRole::EditableText;
+        if (hasValuePattern) {
+            return valueReadOnly ? ElementRole::ReadOnlyText : ElementRole::EditableText;
+        }
+        if (textRangeEditable.has_value()) {
+            return *textRangeEditable ? ElementRole::EditableText : ElementRole::ReadOnlyText;
+        }
+        return ElementRole::EditableText;
     }
     if (type == UIA_DocumentControlTypeId && hasTextPattern) {
-        return hasTextEditPattern || (hasValuePattern && !valueReadOnly) || textRangeEditable
+        return hasTextEditPattern || (hasValuePattern && !valueReadOnly) || textRangeEditable.value_or(false)
             ? ElementRole::EditableText
             : ElementRole::ReadOnlyText;
     }
     if (!isPassword && hasTextPattern && (type == UIA_TextControlTypeId || type == UIA_CustomControlTypeId)) {
+        if (textRangeEditable.has_value()) {
+            return *textRangeEditable ? ElementRole::EditableText : ElementRole::ReadOnlyText;
+        }
         return hasTextEditPattern ? ElementRole::EditableText : ElementRole::ReadOnlyText;
     }
     if (IsActionControl(type, hasInvokePattern)) return ElementRole::Action;
@@ -355,7 +352,7 @@ void AssignSections(
         const auto area = RectArea(section.bounds);
         if (area <= 0) continue;
         const auto windowArea = RectArea(windowBounds);
-        if (!IsStrongSectionControl(section.controlType) && windowArea > 0 && area * 100 >= windowArea * 84) {
+        if (windowArea > 0 && area * 100 >= windowArea * 78) {
             continue;
         }
 
@@ -444,9 +441,12 @@ void CollectWindowElements(
         const bool hasValuePattern = VariantBool(element.Get(), UIA_IsValuePatternAvailablePropertyId);
         const bool hasInvokePattern = VariantBool(element.Get(), UIA_IsInvokePatternAvailablePropertyId);
         const bool valueReadOnly = VariantBool(element.Get(), UIA_ValueIsReadOnlyPropertyId, true);
-        const bool textRangeEditable =
-            (controlType == UIA_DocumentControlTypeId || controlType == UIA_CustomControlTypeId) &&
-            TextRangeReportsEditable(element.Get(), hasTextPattern);
+        const std::optional<bool> textRangeEditable =
+            (controlType == UIA_EditControlTypeId ||
+             controlType == UIA_DocumentControlTypeId ||
+             controlType == UIA_CustomControlTypeId)
+            ? TextRangeReportsEditable(element.Get(), hasTextPattern)
+            : std::nullopt;
         BOOL isPasswordValue = FALSE;
         element->get_CachedIsPassword(&isPasswordValue);
 
@@ -460,10 +460,14 @@ void CollectWindowElements(
             isPasswordValue != FALSE,
             hasInvokePattern);
         if (static_cast<unsigned>(role) == 255U) continue;
-        if (!ElementHasVisibleSample(bounds, windows, windowIndex)) continue;
+        if (!ElementCenterIsVisible(bounds, windows, windowIndex)) continue;
 
         RawElement raw;
         raw.info.bounds = bounds;
+        const auto windowArea = RectArea(window.bounds);
+        raw.info.drawOutline = windowArea <= 0 ||
+            RectArea(bounds) * 100 < windowArea * 78 ||
+            RectWidth(bounds) * 100 < RectWidth(window.bounds) * 90;
         raw.info.role = role;
         raw.info.name = CachedName(element.Get());
         raw.automationElement = std::move(element);
@@ -563,15 +567,25 @@ ComPtr<IUIAutomationTextRange> CloneRange(IUIAutomationTextRange* range) {
     return result;
 }
 
-void SendControlHome() {
-    std::array<INPUT, 4> input{};
+void PlaceEditableCaret(IUIAutomationElement* element) {
+    RECT bounds{};
+    if (element && SUCCEEDED(element->get_CurrentBoundingRectangle(&bounds)) && RectArea(bounds) > 0) {
+        const POINT center = RectCenter(bounds);
+        SetCursorPos(center.x, center.y);
+    }
+
+    std::array<INPUT, 6> input{};
     for (INPUT& item : input) item.type = INPUT_KEYBOARD;
-    input[0].ki.wVk = VK_CONTROL;
-    input[1].ki.wVk = VK_HOME;
-    input[2].ki.wVk = VK_HOME;
-    input[2].ki.dwFlags = KEYEVENTF_KEYUP;
-    input[3].ki.wVk = VK_CONTROL;
-    input[3].ki.dwFlags = KEYEVENTF_KEYUP;
+    input[0].type = INPUT_MOUSE;
+    input[0].mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
+    input[1].type = INPUT_MOUSE;
+    input[1].mi.dwFlags = MOUSEEVENTF_LEFTUP;
+    input[2].ki.wVk = VK_CONTROL;
+    input[3].ki.wVk = VK_HOME;
+    input[4].ki.wVk = VK_HOME;
+    input[4].ki.dwFlags = KEYEVENTF_KEYUP;
+    input[5].ki.wVk = VK_CONTROL;
+    input[5].ki.dwFlags = KEYEVENTF_KEYUP;
     SendInput(static_cast<UINT>(input.size()), input.data(), sizeof(INPUT));
 }
 
@@ -665,6 +679,89 @@ void ClearCaret(AutomationState& state) {
     state.anchorRange.Reset();
     state.documentRange.Reset();
     state.caretElement.Reset();
+}
+
+std::optional<RECT> CurrentCaretBounds(AutomationState& state) {
+    if (!state.caretRange) return std::nullopt;
+    ComPtr<IUIAutomationTextRange> probe = CloneRange(state.caretRange.Get());
+    if (!probe) return std::nullopt;
+
+    int moved = 0;
+    bool useRightEdge = false;
+    if (FAILED(probe->MoveEndpointByUnit(
+            TextPatternRangeEndpoint_End,
+            TextUnit_Character,
+            1,
+            &moved)) || moved == 0) {
+        probe = CloneRange(state.caretRange.Get());
+        if (!probe || FAILED(probe->MoveEndpointByUnit(
+                TextPatternRangeEndpoint_Start,
+                TextUnit_Character,
+                -1,
+                &moved)) || moved == 0) {
+            return std::nullopt;
+        }
+        useRightEdge = true;
+    }
+
+    SAFEARRAY* rectangles = nullptr;
+    if (FAILED(probe->GetBoundingRectangles(&rectangles)) || !rectangles) return std::nullopt;
+    LONG lower = 0;
+    LONG upper = -1;
+    if (FAILED(SafeArrayGetLBound(rectangles, 1, &lower)) ||
+        FAILED(SafeArrayGetUBound(rectangles, 1, &upper)) ||
+        upper - lower + 1 < 4) {
+        SafeArrayDestroy(rectangles);
+        return std::nullopt;
+    }
+
+    double* values = nullptr;
+    if (FAILED(SafeArrayAccessData(rectangles, reinterpret_cast<void**>(&values))) || !values) {
+        SafeArrayDestroy(rectangles);
+        return std::nullopt;
+    }
+    const LONG count = upper - lower + 1;
+    const LONG index = useRightEdge ? count - 4 : 0;
+    const double left = values[index];
+    const double top = values[index + 1];
+    const double width = values[index + 2];
+    const double height = values[index + 3];
+    SafeArrayUnaccessData(rectangles);
+    SafeArrayDestroy(rectangles);
+
+    const LONG x = static_cast<LONG>(std::lround(useRightEdge ? left + width : left));
+    const LONG y = static_cast<LONG>(std::lround(top));
+    const LONG lineHeight = std::max<LONG>(12, static_cast<LONG>(std::lround(height)));
+    if (lineHeight > 200 || x < -100000 || y < -100000) return std::nullopt;
+    return RECT{x, y, x + 2, y + lineHeight};
+}
+
+void PostCaretVisual(HWND replyWindow, AutomationState& state, bool visible) {
+    auto* result = new CaretVisualResult;
+    if (visible) {
+        const std::optional<RECT> bounds = CurrentCaretBounds(state);
+        if (bounds) {
+            result->visible = true;
+            result->bounds = *bounds;
+        } else if (state.caretElement) {
+            RECT elementBounds{};
+            if (SUCCEEDED(state.caretElement->get_CurrentBoundingRectangle(&elementBounds)) &&
+                RectArea(elementBounds) > 0) {
+                result->visible = true;
+                const LONG top = elementBounds.top + std::min<LONG>(6, RectHeight(elementBounds) / 4);
+                result->bounds = RECT{
+                    elementBounds.left + 7,
+                    top,
+                    elementBounds.left + 9,
+                    std::min(elementBounds.bottom - 2, top + 20),
+                };
+            }
+        }
+    }
+    if (!IsWindow(replyWindow) ||
+        !PostMessageW(replyWindow, kMsgCaretVisual, 0, reinterpret_cast<LPARAM>(result))) {
+        delete result;
+    }
 }
 
 bool MoveToBoundary(AutomationState& state, bool end, TextUnit unit) {
@@ -772,6 +869,7 @@ ActivationResult* ActivateElement(
 
         result->mode = ActivationMode::Editable;
         result->succeeded = SUCCEEDED(focusResult) || SUCCEEDED(selectResult);
+        if (result->succeeded) PlaceEditableCaret(stored->automationElement.Get());
         return result;
     }
 
@@ -779,7 +877,9 @@ ActivationResult* ActivateElement(
         ? ActivationMode::Editable
         : ActivationMode::Pointer;
     result->succeeded = SUCCEEDED(focusResult);
-    if (result->mode == ActivationMode::Editable && result->succeeded) SendControlHome();
+    if (result->mode == ActivationMode::Editable && result->succeeded) {
+        PlaceEditableCaret(stored->automationElement.Get());
+    }
     return result;
 }
 
@@ -876,12 +976,15 @@ void AutomationWorker::ThreadMain() {
             }
         } else if (command.type == CommandType::Activate) {
             ActivationResult* result = ActivateElement(state, command.generation, command.elementId);
+            const bool showCaret = result->succeeded && result->mode == ActivationMode::Caret;
             if (!IsWindow(replyWindow_) ||
                 !PostMessageW(replyWindow_, kMsgActivationComplete, 0, reinterpret_cast<LPARAM>(result))) {
                 delete result;
             }
+            PostCaretVisual(replyWindow_, state, showCaret);
         } else if (command.type == CommandType::Caret) {
             HandleCaretInput(state, command.caret);
+            PostCaretVisual(replyWindow_, state, command.caret.action != CaretAction::Exit);
         }
     }
 

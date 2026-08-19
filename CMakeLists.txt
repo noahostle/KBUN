@@ -40,6 +40,7 @@ target_link_libraries(KBUN PRIVATE
     shlwapi
     uiautomationcore
     user32
+    uxtheme
 )
 
 include(CTest)
@@ -57,4 +58,3 @@ if(BUILD_TESTING)
     )
     add_test(NAME hints COMMAND kbun_hints_test)
 endif()
-

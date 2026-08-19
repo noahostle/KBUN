@@ -51,7 +51,7 @@ $sources = @(
 $compile = "rc /nologo /fo `"$resourceOutput`" resources\KBUN.rc && " +
     "cl /nologo /std:c++20 /EHsc /permissive- /W4 $debugFlags /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /DNOMINMAX " +
     "$sources `"$resourceOutput`" /Fe:`"$exeOutput`" /link /SUBSYSTEM:WINDOWS " +
-    "advapi32.lib dwmapi.lib gdi32.lib ole32.lib oleaut32.lib shell32.lib shlwapi.lib uiautomationcore.lib user32.lib"
+    "advapi32.lib dwmapi.lib gdi32.lib ole32.lib oleaut32.lib shell32.lib shlwapi.lib uiautomationcore.lib user32.lib uxtheme.lib"
 
 $command = "call `"$devCmd`" -arch=x64 -host_arch=x64 && cd /d `"$projectRoot`" && $compile"
 & $env:ComSpec /d /s /c $command

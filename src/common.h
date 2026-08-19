@@ -22,6 +22,7 @@ constexpr UINT kMsgCaretKey = WM_APP + 8;
 constexpr UINT kMsgScanComplete = WM_APP + 9;
 constexpr UINT kMsgActivationComplete = WM_APP + 10;
 constexpr UINT kMsgSettingsSaved = WM_APP + 11;
+constexpr UINT kMsgCaretVisual = WM_APP + 12;
 
 enum class ElementRole : std::uint8_t {
     Action,
@@ -35,6 +36,7 @@ struct ElementInfo {
     ElementRole role = ElementRole::Action;
     std::uint64_t sectionId = 0;
     RECT sectionBounds{};
+    bool drawOutline = true;
     std::wstring name;
 };
 
@@ -78,6 +80,11 @@ struct CaretInput {
     bool control = false;
 };
 
+struct CaretVisualResult {
+    bool visible = false;
+    RECT bounds{};
+};
+
 inline int RectWidth(const RECT& rect) noexcept {
     return std::max(0L, rect.right - rect.left);
 }
@@ -110,4 +117,3 @@ inline RECT UnionRects(const RECT& left, const RECT& right) noexcept {
 }
 
 }  // namespace kbun
-

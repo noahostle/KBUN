@@ -1,9 +1,12 @@
 #include "app.h"
 
+#include <dwmapi.h>
+#include <uxtheme.h>
 #include <windowsx.h>
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <memory>
 #include <string>
 #include <utility>
@@ -14,6 +17,11 @@ namespace {
 constexpr wchar_t kAppWindowClass[] = L"KBUN.App";
 constexpr wchar_t kSettingsWindowClass[] = L"KBUN.Settings";
 constexpr wchar_t kSingletonName[] = L"Local\\KBUN.Singleton";
+constexpr COLORREF kSettingsBackground = RGB(17, 21, 25);
+constexpr COLORREF kSettingsField = RGB(29, 35, 41);
+constexpr COLORREF kSettingsText = RGB(233, 238, 242);
+constexpr COLORREF kSettingsMuted = RGB(153, 164, 174);
+constexpr COLORREF kSettingsAccent = RGB(75, 220, 201);
 
 enum CommandId : UINT {
     CommandSettings = 100,
@@ -34,12 +42,17 @@ enum SettingsControlId : int {
     SettingsStartup,
     SettingsSave,
     SettingsCancel,
+    SettingsTitle,
 };
 
 struct SettingsContext {
     HWND appWindow = nullptr;
     Config config;
     bool startup = false;
+    HBRUSH backgroundBrush = nullptr;
+    HBRUSH fieldBrush = nullptr;
+    HFONT font = nullptr;
+    HFONT titleFont = nullptr;
 };
 
 struct SettingsUpdate {
@@ -58,6 +71,10 @@ void SetControlFont(HWND control) {
     SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)), TRUE);
 }
 
+void SetControlFont(HWND control, HFONT font) {
+    SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+}
+
 HWND AddControl(
     HWND parent,
     const wchar_t* className,
@@ -68,15 +85,17 @@ HWND AddControl(
     int width,
     int height,
     int id) {
+    const UINT dpi = GetDpiForWindow(parent);
+    const auto scale = [dpi](int value) { return MulDiv(value, static_cast<int>(dpi), 96); };
     HWND control = CreateWindowExW(
         0,
         className,
         text,
         WS_CHILD | WS_VISIBLE | style,
-        x,
-        y,
-        width,
-        height,
+        scale(x),
+        scale(y),
+        scale(width),
+        scale(height),
         parent,
         reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
         GetModuleHandleW(nullptr),
@@ -101,12 +120,13 @@ void BuildSettingsControls(HWND window, SettingsContext& context) {
     constexpr int inputX = 165;
     constexpr int inputWidth = 190;
     constexpr int rowHeight = 30;
-    int y = 18;
+    HWND title = AddControl(window, L"STATIC", L"KBUN", SS_LEFT, labelX, 15, 335, 34, SettingsTitle);
+    SetControlFont(title, context.titleFont);
+    int y = 57;
 
-    HWND enabled = AddControl(
-        window, L"BUTTON", L"KBUN enabled", BS_AUTOCHECKBOX | WS_TABSTOP,
+    AddControl(
+        window, L"BUTTON", L"KBUN enabled", BS_OWNERDRAW | WS_TABSTOP,
         labelX, y, 335, 24, SettingsEnabled);
-    Button_SetCheck(enabled, context.config.enabled ? BST_CHECKED : BST_UNCHECKED);
     y += rowHeight + 8;
 
     AddControl(window, L"STATIC", L"Navigation key", SS_LEFT, labelX, y + 4, 130, 22, -1);
@@ -146,22 +166,206 @@ void BuildSettingsControls(HWND window, SettingsContext& context) {
     Edit_LimitText(fadeOut, 3);
     y += rowHeight + 5;
 
-    HWND startup = AddControl(
-        window, L"BUTTON", L"Run when I sign in", BS_AUTOCHECKBOX | WS_TABSTOP,
+    AddControl(
+        window, L"BUTTON", L"Run when I sign in", BS_OWNERDRAW | WS_TABSTOP,
         labelX, y, 335, 24, SettingsStartup);
-    Button_SetCheck(startup, context.startup ? BST_CHECKED : BST_UNCHECKED);
 
     AddControl(
         window, L"BUTTON", L"Save", BS_DEFPUSHBUTTON | WS_TABSTOP,
-        195, 280, 76, 28, SettingsSave);
+        195, 319, 76, 30, SettingsSave);
     AddControl(
-        window, L"BUTTON", L"Cancel", BS_PUSHBUTTON | WS_TABSTOP,
-        279, 280, 76, 28, SettingsCancel);
+        window, L"BUTTON", L"Cancel", BS_OWNERDRAW | WS_TABSTOP,
+        279, 319, 76, 30, SettingsCancel);
+
+    SetWindowLongPtrW(GetDlgItem(window, SettingsSave), GWL_STYLE,
+                      GetWindowLongPtrW(GetDlgItem(window, SettingsSave), GWL_STYLE) | BS_OWNERDRAW);
+    EnumChildWindows(window, [](HWND child, LPARAM parameter) -> BOOL {
+        auto* settings = reinterpret_cast<SettingsContext*>(parameter);
+        if (GetDlgCtrlID(child) != SettingsTitle) SetControlFont(child, settings->font);
+        wchar_t className[32]{};
+        GetClassNameW(child, className, static_cast<int>(std::size(className)));
+        if (std::wcscmp(className, L"ComboBox") == 0 || std::wcscmp(className, L"Edit") == 0) {
+            SetWindowTheme(child, L"DarkMode_CFD", nullptr);
+        } else {
+            SetWindowTheme(child, L"DarkMode_Explorer", nullptr);
+        }
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&context));
+}
+
+void InitializeSettingsStyle(HWND window, SettingsContext& context) {
+    const UINT dpi = GetDpiForWindow(window);
+    context.backgroundBrush = CreateSolidBrush(kSettingsBackground);
+    context.fieldBrush = CreateSolidBrush(kSettingsField);
+    context.font = CreateFontW(
+        -MulDiv(10, static_cast<int>(dpi), 72), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+        DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI Variable Text");
+    context.titleFont = CreateFontW(
+        -MulDiv(20, static_cast<int>(dpi), 72), 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+        DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI Variable Display");
+
+    const BOOL dark = TRUE;
+    DwmSetWindowAttribute(window, 20, &dark, sizeof(dark));
+    const DWM_WINDOW_CORNER_PREFERENCE corners = DWMWCP_ROUND;
+    DwmSetWindowAttribute(window, DWMWA_WINDOW_CORNER_PREFERENCE, &corners, sizeof(corners));
+    SetWindowTheme(window, L"DarkMode_Explorer", nullptr);
+}
+
+void ReleaseSettingsStyle(SettingsContext& context) {
+    if (context.backgroundBrush) DeleteObject(context.backgroundBrush);
+    if (context.fieldBrush) DeleteObject(context.fieldBrush);
+    if (context.font) DeleteObject(context.font);
+    if (context.titleFont) DeleteObject(context.titleFont);
+    context.backgroundBrush = nullptr;
+    context.fieldBrush = nullptr;
+    context.font = nullptr;
+    context.titleFont = nullptr;
+}
+
+void PaintSettingsBackground(HWND window, SettingsContext& context) {
+    PAINTSTRUCT paint{};
+    HDC dc = BeginPaint(window, &paint);
+    RECT client{};
+    GetClientRect(window, &client);
+    FillRect(dc, &client, context.backgroundBrush);
+
+    constexpr std::array<COLORREF, 7> colors{
+        RGB(255, 86, 129), RGB(255, 139, 73), RGB(246, 211, 78), RGB(83, 220, 150),
+        RGB(71, 205, 242), RGB(105, 129, 255), RGB(208, 98, 242),
+    };
+    constexpr int segmentCount = 56;
+    const int segmentWidth = std::max(1, RectWidth(client) / segmentCount);
+    const int stripHeight = std::max(3, MulDiv(3, static_cast<int>(GetDpiForWindow(window)), 96));
+    for (int index = 0; index < segmentCount; ++index) {
+        const double position = static_cast<double>(index) * (colors.size() - 1) / (segmentCount - 1);
+        const int colorIndex = std::min(static_cast<int>(colors.size()) - 2, static_cast<int>(position));
+        const double blend = position - colorIndex;
+        const auto channel = [blend](BYTE from, BYTE to) {
+            return static_cast<BYTE>(std::lround(from + (to - from) * blend));
+        };
+        const COLORREF color = RGB(
+            channel(GetRValue(colors[colorIndex]), GetRValue(colors[colorIndex + 1])),
+            channel(GetGValue(colors[colorIndex]), GetGValue(colors[colorIndex + 1])),
+            channel(GetBValue(colors[colorIndex]), GetBValue(colors[colorIndex + 1])));
+        RECT segment{
+            static_cast<LONG>(index * segmentWidth),
+            0,
+            index + 1 == segmentCount ? client.right : static_cast<LONG>((index + 1) * segmentWidth),
+            stripHeight,
+        };
+        HBRUSH brush = CreateSolidBrush(color);
+        FillRect(dc, &segment, brush);
+        DeleteObject(brush);
+    }
+    EndPaint(window, &paint);
+}
+
+void DrawSettingsToggle(const DRAWITEMSTRUCT& item) {
+    RECT bounds = item.rcItem;
+    const auto* context = reinterpret_cast<SettingsContext*>(
+        GetWindowLongPtrW(GetParent(item.hwndItem), GWLP_USERDATA));
+    const bool checked = context && (item.CtlID == SettingsEnabled
+        ? context->config.enabled
+        : context->startup);
+    const bool pressed = (item.itemState & ODS_SELECTED) != 0;
+    const int dpi = GetDeviceCaps(item.hDC, LOGPIXELSY);
+    const int trackWidth = MulDiv(34, dpi, 96);
+    const int trackHeight = MulDiv(18, dpi, 96);
+    HBRUSH background = CreateSolidBrush(kSettingsBackground);
+    FillRect(item.hDC, &bounds, background);
+    DeleteObject(background);
+    RECT track{
+        bounds.left + 1,
+        bounds.top + (RectHeight(bounds) - trackHeight) / 2,
+        bounds.left + 1 + trackWidth,
+        bounds.top + (RectHeight(bounds) - trackHeight) / 2 + trackHeight,
+    };
+
+    const COLORREF trackColor = checked
+        ? (pressed ? RGB(48, 174, 163) : kSettingsAccent)
+        : (pressed ? RGB(47, 55, 62) : kSettingsField);
+    HBRUSH trackBrush = CreateSolidBrush(trackColor);
+    HPEN trackPen = CreatePen(PS_SOLID, 1, checked ? kSettingsAccent : RGB(75, 85, 94));
+    HGDIOBJ previousBrush = SelectObject(item.hDC, trackBrush);
+    HGDIOBJ previousPen = SelectObject(item.hDC, trackPen);
+    RoundRect(item.hDC, track.left, track.top, track.right, track.bottom, trackHeight, trackHeight);
+    SelectObject(item.hDC, previousPen);
+    SelectObject(item.hDC, previousBrush);
+    DeleteObject(trackPen);
+    DeleteObject(trackBrush);
+
+    const int knobSize = trackHeight - MulDiv(4, dpi, 96);
+    const int knobInset = MulDiv(2, dpi, 96);
+    const int knobLeft = checked ? track.right - knobInset - knobSize : track.left + knobInset;
+    RECT knob{
+        knobLeft,
+        track.top + (trackHeight - knobSize) / 2,
+        knobLeft + knobSize,
+        track.top + (trackHeight - knobSize) / 2 + knobSize,
+    };
+    HBRUSH knobBrush = CreateSolidBrush(checked ? RGB(9, 35, 34) : RGB(205, 214, 220));
+    previousBrush = SelectObject(item.hDC, knobBrush);
+    previousPen = SelectObject(item.hDC, GetStockObject(NULL_PEN));
+    Ellipse(item.hDC, knob.left, knob.top, knob.right, knob.bottom);
+    SelectObject(item.hDC, previousPen);
+    SelectObject(item.hDC, previousBrush);
+    DeleteObject(knobBrush);
+
+    RECT textBounds = bounds;
+    textBounds.left = track.right + MulDiv(10, dpi, 96);
+    wchar_t label[64]{};
+    GetWindowTextW(item.hwndItem, label, static_cast<int>(std::size(label)));
+    SetBkMode(item.hDC, TRANSPARENT);
+    SetTextColor(item.hDC, kSettingsText);
+    HGDIOBJ previousFont = SelectObject(
+        item.hDC,
+        reinterpret_cast<HFONT>(SendMessageW(item.hwndItem, WM_GETFONT, 0, 0)));
+    DrawTextW(item.hDC, label, -1, &textBounds,
+              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    SelectObject(item.hDC, previousFont);
+
+    if ((item.itemState & ODS_FOCUS) != 0) {
+        RECT focus = textBounds;
+        DrawFocusRect(item.hDC, &focus);
+    }
+}
+
+void DrawSettingsButton(const DRAWITEMSTRUCT& item) {
+    RECT bounds = item.rcItem;
+    const bool save = item.CtlID == SettingsSave;
+    const bool pressed = (item.itemState & ODS_SELECTED) != 0;
+    const COLORREF fill = save
+        ? (pressed ? RGB(48, 174, 163) : kSettingsAccent)
+        : (pressed ? RGB(43, 50, 57) : kSettingsField);
+    const COLORREF text = save ? RGB(7, 20, 20) : kSettingsText;
+    HBRUSH brush = CreateSolidBrush(fill);
+    HPEN pen = CreatePen(PS_SOLID, 1, save ? kSettingsAccent : RGB(69, 79, 88));
+    HGDIOBJ previousBrush = SelectObject(item.hDC, brush);
+    HGDIOBJ previousPen = SelectObject(item.hDC, pen);
+    RoundRect(item.hDC, bounds.left, bounds.top, bounds.right, bounds.bottom, 8, 8);
+    SelectObject(item.hDC, previousPen);
+    SelectObject(item.hDC, previousBrush);
+    DeleteObject(pen);
+    DeleteObject(brush);
+
+    wchar_t label[64]{};
+    GetWindowTextW(item.hwndItem, label, static_cast<int>(std::size(label)));
+    SetBkMode(item.hDC, TRANSPARENT);
+    SetTextColor(item.hDC, text);
+    HGDIOBJ previousFont = SelectObject(item.hDC, reinterpret_cast<HFONT>(SendMessageW(item.hwndItem, WM_GETFONT, 0, 0)));
+    DrawTextW(item.hDC, label, -1, &bounds, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    SelectObject(item.hDC, previousFont);
+
+    if ((item.itemState & ODS_FOCUS) != 0) {
+        InflateRect(&bounds, -3, -3);
+        DrawFocusRect(item.hDC, &bounds);
+    }
 }
 
 bool ReadSettings(HWND window, SettingsContext& context) {
     Config updated = context.config;
-    updated.enabled = Button_GetCheck(GetDlgItem(window, SettingsEnabled)) == BST_CHECKED;
     updated.navigationKey = ComboKey(window, SettingsNavigation, NavigationKeyChoices());
     updated.leftClickKey = ComboKey(window, SettingsLeftClick, ClickKeyChoices());
     updated.rightClickKey = ComboKey(window, SettingsRightClick, ClickKeyChoices());
@@ -177,7 +381,6 @@ bool ReadSettings(HWND window, SettingsContext& context) {
         return false;
     }
     context.config = updated;
-    context.startup = Button_GetCheck(GetDlgItem(window, SettingsStartup)) == BST_CHECKED;
     return true;
 }
 
@@ -191,9 +394,56 @@ LRESULT CALLBACK SettingsWindowProcedure(HWND window, UINT message, WPARAM wPara
 
     switch (message) {
         case WM_CREATE:
+            InitializeSettingsStyle(window, *context);
             BuildSettingsControls(window, *context);
             return 0;
+        case WM_PAINT:
+            PaintSettingsBackground(window, *context);
+            return 0;
+        case WM_ERASEBKGND:
+            return 1;
+        case WM_CTLCOLORSTATIC: {
+            HDC dc = reinterpret_cast<HDC>(wParam);
+            SetTextColor(dc, GetDlgCtrlID(reinterpret_cast<HWND>(lParam)) == SettingsTitle
+                                 ? kSettingsText : kSettingsMuted);
+            SetBkMode(dc, TRANSPARENT);
+            return reinterpret_cast<LRESULT>(GetStockObject(NULL_BRUSH));
+        }
+        case WM_CTLCOLOREDIT:
+        case WM_CTLCOLORLISTBOX: {
+            HDC dc = reinterpret_cast<HDC>(wParam);
+            SetTextColor(dc, kSettingsText);
+            SetBkColor(dc, kSettingsField);
+            return reinterpret_cast<LRESULT>(context->fieldBrush);
+        }
+        case WM_CTLCOLORBTN: {
+            HDC dc = reinterpret_cast<HDC>(wParam);
+            SetTextColor(dc, kSettingsText);
+            SetBkMode(dc, TRANSPARENT);
+            return reinterpret_cast<LRESULT>(context->backgroundBrush);
+        }
+        case WM_DRAWITEM:
+            if (wParam == SettingsSave || wParam == SettingsCancel) {
+                DrawSettingsButton(*reinterpret_cast<DRAWITEMSTRUCT*>(lParam));
+                return TRUE;
+            }
+            if (wParam == SettingsEnabled || wParam == SettingsStartup) {
+                DrawSettingsToggle(*reinterpret_cast<DRAWITEMSTRUCT*>(lParam));
+                return TRUE;
+            }
+            break;
         case WM_COMMAND:
+            if ((LOWORD(wParam) == SettingsEnabled || LOWORD(wParam) == SettingsStartup) &&
+                HIWORD(wParam) == BN_CLICKED) {
+                HWND toggle = reinterpret_cast<HWND>(lParam);
+                if (LOWORD(wParam) == SettingsEnabled) {
+                    context->config.enabled = !context->config.enabled;
+                } else {
+                    context->startup = !context->startup;
+                }
+                InvalidateRect(toggle, nullptr, TRUE);
+                return 0;
+            }
             if (LOWORD(wParam) == SettingsSave) {
                 if (!ReadSettings(window, *context)) return 0;
                 auto* update = new SettingsUpdate{context->config, context->startup};
@@ -214,6 +464,7 @@ LRESULT CALLBACK SettingsWindowProcedure(HWND window, UINT message, WPARAM wPara
         case WM_NCDESTROY:
             if (context) {
                 PostMessageW(context->appWindow, kMsgSettingsSaved, 1, 0);
+                ReleaseSettingsStyle(*context);
                 delete context;
                 SetWindowLongPtrW(window, GWLP_USERDATA, 0);
             }
@@ -230,24 +481,43 @@ HICON CreateTrayIcon() {
     HDC colorDc = CreateCompatibleDC(screen);
     HBITMAP color = CreateCompatibleBitmap(screen, size, size);
     HGDIOBJ oldColor = SelectObject(colorDc, color);
-    HBRUSH background = CreateSolidBrush(RGB(18, 29, 36));
+    HBRUSH outside = CreateSolidBrush(RGB(0, 0, 0));
     RECT bounds{0, 0, size, size};
-    FillRect(colorDc, &bounds, background);
-    DeleteObject(background);
-    HPEN border = CreatePen(PS_SOLID, 2, RGB(42, 210, 190));
-    HGDIOBJ oldPen = SelectObject(colorDc, border);
-    HGDIOBJ oldBrush = SelectObject(colorDc, GetStockObject(HOLLOW_BRUSH));
-    Rectangle(colorDc, 1, 1, size - 1, size - 1);
+    FillRect(colorDc, &bounds, outside);
+    DeleteObject(outside);
+    HBRUSH background = CreateSolidBrush(RGB(17, 22, 27));
+    HPEN baseBorder = CreatePen(PS_SOLID, 2, RGB(94, 126, 255));
+    HGDIOBJ oldPen = SelectObject(colorDc, baseBorder);
+    HGDIOBJ oldBrush = SelectObject(colorDc, background);
+    RoundRect(colorDc, 2, 2, size - 2, size - 2, 9, 9);
     SelectObject(colorDc, oldBrush);
     SelectObject(colorDc, oldPen);
-    DeleteObject(border);
-    HFONT font = CreateFontW(-21, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-                            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
-                            DEFAULT_PITCH, L"Segoe UI");
+    DeleteObject(background);
+    DeleteObject(baseBorder);
+
+    constexpr std::array<COLORREF, 4> edgeColors{
+        RGB(255, 91, 139), RGB(255, 197, 76), RGB(66, 218, 192), RGB(92, 137, 255),
+    };
+    constexpr std::array<POINT, 8> edgePoints{
+        POINT{7, 3}, POINT{25, 3}, POINT{28, 7}, POINT{28, 25},
+        POINT{25, 28}, POINT{7, 28}, POINT{3, 25}, POINT{3, 7},
+    };
+    for (std::size_t index = 0; index < edgeColors.size(); ++index) {
+        HPEN pen = CreatePen(PS_SOLID, 2, edgeColors[index]);
+        oldPen = SelectObject(colorDc, pen);
+        MoveToEx(colorDc, edgePoints[index * 2].x, edgePoints[index * 2].y, nullptr);
+        LineTo(colorDc, edgePoints[index * 2 + 1].x, edgePoints[index * 2 + 1].y);
+        SelectObject(colorDc, oldPen);
+        DeleteObject(pen);
+    }
+
+    HFONT font = CreateFontW(-20, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                            DEFAULT_PITCH, L"Segoe UI Variable Display");
     HGDIOBJ oldFont = SelectObject(colorDc, font);
     SetBkMode(colorDc, TRANSPARENT);
     SetTextColor(colorDc, RGB(248, 250, 252));
-    DrawTextW(colorDc, L"K", 1, &bounds, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    DrawTextW(colorDc, L"k", 1, &bounds, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     SelectObject(colorDc, oldFont);
     DeleteObject(font);
     SelectObject(colorDc, oldColor);
@@ -257,7 +527,14 @@ HICON CreateTrayIcon() {
     HBITMAP mask = CreateBitmap(size, size, 1, 1, nullptr);
     HDC maskDc = CreateCompatibleDC(nullptr);
     HGDIOBJ oldMask = SelectObject(maskDc, mask);
-    PatBlt(maskDc, 0, 0, size, size, BLACKNESS);
+    PatBlt(maskDc, 0, 0, size, size, WHITENESS);
+    HBRUSH maskBrush = static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
+    HPEN maskPen = static_cast<HPEN>(GetStockObject(BLACK_PEN));
+    HGDIOBJ previousMaskBrush = SelectObject(maskDc, maskBrush);
+    HGDIOBJ previousMaskPen = SelectObject(maskDc, maskPen);
+    RoundRect(maskDc, 2, 2, size - 2, size - 2, 9, 9);
+    SelectObject(maskDc, previousMaskPen);
+    SelectObject(maskDc, previousMaskBrush);
     SelectObject(maskDc, oldMask);
     DeleteDC(maskDc);
 
@@ -423,12 +700,13 @@ void App::ShowSettings() {
     windowClass.lpfnWndProc = SettingsWindowProcedure;
     windowClass.lpszClassName = kSettingsWindowClass;
     windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    windowClass.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+    windowClass.hbrBackground = nullptr;
     RegisterClassExW(&windowClass);
 
     auto* context = new SettingsContext{window_, config_, IsRunAtStartupEnabled()};
-    const int width = 395;
-    const int height = 355;
+    const UINT dpi = GetDpiForSystem();
+    const int width = MulDiv(395, static_cast<int>(dpi), 96);
+    const int height = MulDiv(405, static_cast<int>(dpi), 96);
     const int x = GetSystemMetrics(SM_XVIRTUALSCREEN) + (GetSystemMetrics(SM_CXVIRTUALSCREEN) - width) / 2;
     const int y = GetSystemMetrics(SM_YVIRTUALSCREEN) + (GetSystemMetrics(SM_CYVIRTUALSCREEN) - height) / 2;
     settingsWindow_ = CreateWindowExW(
@@ -440,7 +718,7 @@ void App::ShowSettings() {
         y,
         width,
         height,
-        window_,
+        nullptr,
         nullptr,
         instance_,
         context);
@@ -464,6 +742,7 @@ void App::BeginNavigation() {
     if (!config_.enabled || shuttingDown_) return;
     pointerArmed_.store(false, std::memory_order_release);
     LeaveCaretMode();
+    overlay_.HideCaret();
 
     overlayCapturing_.store(true, std::memory_order_release);
     requestedGeneration_ = ++nextGeneration_;
@@ -519,6 +798,7 @@ void App::SelectElement(const ElementInfo& element) {
     overlayCapturing_.store(false, std::memory_order_release);
     automation_.CancelScan(requestedGeneration_);
     overlay_.FadeOut();
+    overlay_.HideCaret();
     const POINT center = RectCenter(element.bounds);
     SetCursorPos(center.x, center.y);
 
@@ -559,6 +839,7 @@ void App::HandleActivationResult(ActivationResult* rawResult) {
     pendingActivationId_ = 0;
 
     if (!result->succeeded) {
+        overlay_.HideCaret();
         pointerArmed_.store(true, std::memory_order_release);
         return;
     }
@@ -566,6 +847,7 @@ void App::HandleActivationResult(ActivationResult* rawResult) {
         caretMode_.store(true, std::memory_order_release);
     } else {
         caretMode_.store(false, std::memory_order_release);
+        overlay_.HideCaret();
     }
 }
 
@@ -574,7 +856,10 @@ void App::HandleCaretMessage(WPARAM wParam, LPARAM lParam) {
     input.action = static_cast<CaretAction>(wParam);
     input.extend = (lParam & 1) != 0;
     input.control = (lParam & 2) != 0;
-    if (input.action == CaretAction::Exit) caretMode_.store(false, std::memory_order_release);
+    if (input.action == CaretAction::Exit) {
+        caretMode_.store(false, std::memory_order_release);
+        overlay_.HideCaret();
+    }
     automation_.SendCaretInput(input);
 }
 
@@ -589,6 +874,7 @@ void App::SendPointerClick(bool rightButton) {
 }
 
 void App::LeaveCaretMode() {
+    overlay_.HideCaret();
     if (!caretMode_.exchange(false, std::memory_order_acq_rel)) return;
     automation_.SendCaretInput(CaretInput{CaretAction::Exit});
 }
@@ -666,6 +952,15 @@ LRESULT App::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         case kMsgActivationComplete:
             HandleActivationResult(reinterpret_cast<ActivationResult*>(lParam));
             return 0;
+        case kMsgCaretVisual: {
+            std::unique_ptr<CaretVisualResult> result(reinterpret_cast<CaretVisualResult*>(lParam));
+            if (result && result->visible && caretMode_.load(std::memory_order_acquire)) {
+                overlay_.ShowCaret(result->bounds);
+            } else {
+                overlay_.HideCaret();
+            }
+            return 0;
+        }
         case kMsgSettingsSaved:
             if (wParam == 1) {
                 settingsWindow_ = nullptr;
