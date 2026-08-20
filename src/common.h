@@ -23,12 +23,53 @@ constexpr UINT kMsgScanComplete = WM_APP + 9;
 constexpr UINT kMsgActivationComplete = WM_APP + 10;
 constexpr UINT kMsgSettingsSaved = WM_APP + 11;
 constexpr UINT kMsgCaretVisual = WM_APP + 12;
+constexpr UINT kMsgSelectionCancel = WM_APP + 13;
+constexpr UINT kMsgKeyCaptureBegin = WM_APP + 14;
+constexpr UINT kMsgKeyCaptureInput = WM_APP + 15;
+constexpr UINT kMsgKeyCaptureEnd = WM_APP + 16;
 
 enum class ElementRole : std::uint8_t {
     Action,
+    DropDown,
+    Option,
     EditableText,
     ReadOnlyText,
 };
+
+inline bool IsTextRole(ElementRole role) noexcept {
+    return role == ElementRole::EditableText || role == ElementRole::ReadOnlyText;
+}
+
+inline bool IsButtonRole(ElementRole role) noexcept {
+    return role == ElementRole::Action || role == ElementRole::DropDown || role == ElementRole::Option;
+}
+
+inline bool IsModifierKey(UINT virtualKey) noexcept {
+    switch (virtualKey) {
+        case VK_SHIFT:
+        case VK_LSHIFT:
+        case VK_RSHIFT:
+        case VK_CONTROL:
+        case VK_LCONTROL:
+        case VK_RCONTROL:
+        case VK_MENU:
+        case VK_LMENU:
+        case VK_RMENU:
+        case VK_LWIN:
+        case VK_RWIN:
+            return true;
+        default:
+            return false;
+    }
+}
+
+inline bool ShouldDismissSelectionForKey(
+    UINT virtualKey,
+    bool down,
+    bool wasDown,
+    bool injected) noexcept {
+    return down && !wasDown && !injected && !IsModifierKey(virtualKey);
+}
 
 struct ElementInfo {
     std::uint64_t id = 0;
@@ -82,6 +123,8 @@ struct CaretInput {
 };
 
 struct CaretVisualResult {
+    std::uint64_t generation = 0;
+    std::uint64_t elementId = 0;
     bool visible = false;
     RECT bounds{};
 };

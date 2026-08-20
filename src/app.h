@@ -27,6 +27,12 @@ public:
     int Run();
 
 private:
+    enum class TargetFilter : std::uint8_t {
+        All,
+        Buttons,
+        Text,
+    };
+
     static LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
     static LRESULT CALLBACK KeyboardProcedure(int code, WPARAM wParam, LPARAM lParam);
     LRESULT HandleMessage(UINT message, WPARAM wParam, LPARAM lParam);
@@ -45,14 +51,21 @@ private:
     void EndNavigation();
     void CancelNavigation();
     void RefreshScan();
-    void HandleHintLetter(wchar_t letter);
+    void HandleHintLetter(wchar_t letter, LPARAM modifiers);
     void HandleHintBack();
-    void SelectElement(const ElementInfo& element);
+    void SelectElement(const ElementInfo& element, LPARAM modifiers = 0);
     void HandleScanResult(ScanResult* result);
     void HandleActivationResult(ActivationResult* result);
     void HandleCaretMessage(WPARAM wParam, LPARAM lParam);
     void SendPointerClick(bool rightButton);
+    void PerformPointerClick(bool rightButton, int count);
     void LeaveCaretMode();
+    void DismissSelection(bool sendCaretExit = true);
+    void SetMouseCursorHidden(bool hidden);
+    void ShowHintsForScan(const ScanResult& scan);
+    std::vector<ElementInfo> FilterElements(const std::vector<ElementInfo>& elements) const;
+    void RefreshDropdownOptions();
+    void RecreateTrayIcon();
     void ApplyConfig(Config updated, bool runAtStartup);
 
     static App* activeApp_;
@@ -76,6 +89,9 @@ private:
     std::uint64_t nextGeneration_ = 0;
     std::uint64_t requestedGeneration_ = 0;
     std::uint64_t pendingActivationId_ = 0;
+    std::uint64_t selectedGeneration_ = 0;
+    std::optional<ElementInfo> selectedElement_;
+    std::optional<ElementInfo> dropdownParent_;
 
     std::array<bool, 256> keyDown_{};
     std::array<bool, 256> suppressed_{};
@@ -84,8 +100,15 @@ private:
     std::atomic_bool overlayCapturing_{false};
     std::atomic_bool pointerArmed_{false};
     std::atomic_bool caretMode_{false};
+    std::atomic_bool selectionActive_{false};
+    std::atomic_bool settingsKeyCapture_{false};
+    std::atomic<UINT> settingsCapturedKey_{0};
+    TargetFilter targetFilter_ = TargetFilter::All;
+    bool filterShortcutArmed_ = false;
+    bool dropdownMode_ = false;
+    int dropdownRefreshAttempts_ = 0;
+    bool mouseCursorHidden_ = false;
     bool shuttingDown_ = false;
 };
 
 }  // namespace kbun
-

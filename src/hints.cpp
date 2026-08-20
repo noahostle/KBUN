@@ -15,6 +15,7 @@ constexpr std::size_t kMaxMajorGroups = 18;
 struct MajorGroup {
     std::vector<std::size_t> members;
     RECT bounds{};
+    HWND ownerWindow = nullptr;
     bool protectsOverlap = false;
 };
 
@@ -75,6 +76,7 @@ std::vector<MajorGroup> BuildOverlapGroups(
 
         MajorGroup group;
         group.bounds = outer.bounds;
+        group.ownerWindow = outer.ownerWindow;
         group.protectsOverlap = true;
         group.members.reserve(children.size() + 1);
         group.members.push_back(outerIndex);
@@ -86,54 +88,88 @@ std::vector<MajorGroup> BuildOverlapGroups(
     return groups;
 }
 
-void FlattenOverlappingGroups(
+void AppendUnique(std::vector<std::size_t>& destination, const std::vector<std::size_t>& source) {
+    for (const std::size_t member : source) {
+        if (std::ranges::find(destination, member) == destination.end()) destination.push_back(member);
+    }
+}
+
+void ResolveOverlappingGroups(
     const std::vector<ElementInfo>& elements,
     std::vector<MajorGroup>& groups,
     std::vector<std::size_t>& direct) {
-    std::vector<bool> flatten(groups.size(), false);
-    for (std::size_t left = 0; left < groups.size(); ++left) {
-        for (std::size_t right = left + 1; right < groups.size(); ++right) {
-            if (!HasNestedOverlap(groups[left].bounds, groups[right].bounds)) continue;
-            if (groups[left].protectsOverlap != groups[right].protectsOverlap) {
-                flatten[groups[left].protectsOverlap ? right : left] = true;
-            } else {
-                const std::size_t larger = RectArea(groups[left].bounds) >= RectArea(groups[right].bounds)
+    for (;;) {
+        bool changed = false;
+        for (std::size_t left = 0; left < groups.size() && !changed; ++left) {
+            for (std::size_t right = left + 1; right < groups.size(); ++right) {
+                if (groups[left].ownerWindow != groups[right].ownerWindow ||
+                    !HasNestedOverlap(groups[left].bounds, groups[right].bounds)) {
+                    continue;
+                }
+
+                const std::size_t parent = RectArea(groups[left].bounds) >= RectArea(groups[right].bounds)
                     ? left
                     : right;
-                flatten[larger] = true;
-            }
-        }
-
-        if (groups[left].protectsOverlap) continue;
-        for (const std::size_t elementIndex : direct) {
-            if (RectArea(groups[left].bounds) < RectArea(elements[elementIndex].bounds)) continue;
-            if (HasNestedOverlap(groups[left].bounds, elements[elementIndex].bounds)) {
-                flatten[left] = true;
+                const std::size_t child = parent == left ? right : left;
+                std::vector<std::size_t> merged = groups[parent].members;
+                AppendUnique(merged, groups[child].members);
+                if (merged.size() <= kAlphabetSize) {
+                    groups[parent].members = std::move(merged);
+                    groups[parent].protectsOverlap = true;
+                    groups.erase(groups.begin() + static_cast<std::ptrdiff_t>(child));
+                } else {
+                    AppendUnique(direct, groups[parent].members);
+                    groups.erase(groups.begin() + static_cast<std::ptrdiff_t>(parent));
+                }
+                changed = true;
                 break;
             }
         }
-    }
+        if (changed) continue;
 
-    std::vector<MajorGroup> kept;
-    kept.reserve(groups.size());
-    for (std::size_t index = 0; index < groups.size(); ++index) {
-        if (flatten[index]) {
-            direct.insert(direct.end(), groups[index].members.begin(), groups[index].members.end());
-        } else {
-            kept.push_back(std::move(groups[index]));
+        for (std::size_t groupIndex = 0; groupIndex < groups.size() && !changed; ++groupIndex) {
+            for (std::size_t directIndex = 0; directIndex < direct.size(); ++directIndex) {
+                const ElementInfo& target = elements[direct[directIndex]];
+                if (groups[groupIndex].ownerWindow != target.ownerWindow ||
+                    !HasNestedOverlap(groups[groupIndex].bounds, target.bounds)) {
+                    continue;
+                }
+
+                if (groups[groupIndex].members.size() < kAlphabetSize) {
+                    groups[groupIndex].members.push_back(direct[directIndex]);
+                    groups[groupIndex].protectsOverlap = true;
+                    direct.erase(direct.begin() + static_cast<std::ptrdiff_t>(directIndex));
+                } else {
+                    AppendUnique(direct, groups[groupIndex].members);
+                    groups.erase(groups.begin() + static_cast<std::ptrdiff_t>(groupIndex));
+                }
+                changed = true;
+                break;
+            }
         }
+        if (!changed) break;
     }
-    groups = std::move(kept);
 }
 
 }  // namespace
 
-void HintNavigator::Reset(std::uint64_t generation, std::vector<ElementInfo> elements) {
+void HintNavigator::Reset(
+    std::uint64_t generation,
+    std::vector<ElementInfo> elements,
+    HintOptions options) {
     generation_ = generation;
     elements_ = std::move(elements);
+    options_ = std::move(options);
     stack_.clear();
     prefix_.clear();
-    if (!elements_.empty()) stack_.push_back(BuildTopScope());
+    if (elements_.empty()) return;
+    if (options_.singleLetter) {
+        std::vector<std::size_t> members(elements_.size());
+        std::iota(members.begin(), members.end(), 0);
+        stack_.push_back(BuildInnerScope(std::move(members)));
+    } else {
+        stack_.push_back(BuildTopScope());
+    }
 }
 
 void HintNavigator::Clear() {
@@ -141,6 +177,7 @@ void HintNavigator::Clear() {
     elements_.clear();
     stack_.clear();
     prefix_.clear();
+    options_ = {};
 }
 
 RECT HintNavigator::MembersBounds(
@@ -177,8 +214,13 @@ HintNavigator::Scope HintNavigator::BuildTopScope() const {
             if (members.size() <= kAlphabetSize) {
                 RECT bounds = MembersBounds(elements_, members);
                 const RECT sectionBounds = elements_[members.front()].sectionBounds;
+                const HWND ownerWindow = elements_[members.front()].ownerWindow;
                 if (RectArea(sectionBounds) > 0) bounds = sectionBounds;
-                majorGroups.push_back({std::move(members), bounds, false});
+                majorGroups.push_back({
+                    std::move(members),
+                    bounds,
+                    ownerWindow,
+                    false});
             } else {
                 for (std::size_t begin = 0; begin < members.size(); begin += kAlphabetSize) {
                     const std::size_t end = std::min(members.size(), begin + kAlphabetSize);
@@ -186,7 +228,12 @@ HintNavigator::Scope HintNavigator::BuildTopScope() const {
                         members.begin() + static_cast<std::ptrdiff_t>(begin),
                         members.begin() + static_cast<std::ptrdiff_t>(end));
                     const RECT bounds = MembersBounds(elements_, chunk);
-                    majorGroups.push_back({std::move(chunk), bounds, false});
+                    const HWND ownerWindow = elements_[chunk.front()].ownerWindow;
+                    majorGroups.push_back({
+                        std::move(chunk),
+                        bounds,
+                        ownerWindow,
+                        false});
                 }
             }
         } else {
@@ -194,14 +241,22 @@ HintNavigator::Scope HintNavigator::BuildTopScope() const {
         }
     }
 
-    // Nested UIA sections can both qualify as hint groups. Keep the smaller,
-    // more specific group and expose the larger group's targets directly.
-    FlattenOverlappingGroups(elements_, majorGroups, direct);
+    // Keep overlapping targets in one flat, one-step scope whenever the
+    // alphabet can hold them. Over-capacity parents fall back to direct hints.
+    ResolveOverlappingGroups(elements_, majorGroups, direct);
+
+    std::wstring topAlphabet = kHintAlphabet;
+    std::erase_if(topAlphabet, [this](wchar_t letter) {
+        return std::ranges::any_of(options_.reservedTopLetters, [letter](wchar_t reserved) {
+            return std::towupper(reserved) == letter;
+        });
+    });
 
     std::ranges::sort(majorGroups, [this](const auto& left, const auto& right) {
         return SpatialLess(left.bounds, right.bounds);
     });
-    while (majorGroups.size() > kMaxMajorGroups) {
+    const std::size_t maximumGroups = std::min(kMaxMajorGroups, topAlphabet.size());
+    while (majorGroups.size() > maximumGroups) {
         auto candidate = std::ranges::find_if(
             majorGroups.rbegin(),
             majorGroups.rend(),
@@ -221,19 +276,19 @@ HintNavigator::Scope HintNavigator::BuildTopScope() const {
         node.group = true;
         node.members = std::move(majorGroups[index].members);
         node.bounds = majorGroups[index].bounds;
-        node.code.assign(1, kHintAlphabet[index]);
+        node.code.assign(1, topAlphabet[index]);
         scope.nodes.push_back(std::move(node));
     }
 
     const std::size_t reserved = majorGroups.size();
     for (std::size_t index = 0; index < direct.size(); ++index) {
         const std::size_t first = reserved + index / kAlphabetSize;
-        if (first >= kAlphabetSize) break;
+        if (first >= topAlphabet.size()) break;
         Node node;
         node.elementIndex = direct[index];
         node.bounds = elements_[node.elementIndex].bounds;
         node.drawOutline = elements_[node.elementIndex].drawOutline;
-        node.code.push_back(kHintAlphabet[first]);
+        node.code.push_back(topAlphabet[first]);
         node.code.push_back(kHintAlphabet[index % kAlphabetSize]);
         scope.nodes.push_back(std::move(node));
     }

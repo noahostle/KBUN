@@ -17,6 +17,7 @@ struct DisplayHint {
     bool isGroup = false;
     bool prefixMatch = true;
     bool drawOutline = true;
+    bool showLabel = true;
 };
 
 struct HintOutcome {
@@ -29,9 +30,17 @@ struct HintOutcome {
     ElementInfo element;
 };
 
+struct HintOptions {
+    bool singleLetter = false;
+    std::wstring reservedTopLetters;
+};
+
 class HintNavigator {
 public:
-    void Reset(std::uint64_t generation, std::vector<ElementInfo> elements);
+    void Reset(
+        std::uint64_t generation,
+        std::vector<ElementInfo> elements,
+        HintOptions options = {});
     void Clear();
 
     HintOutcome Input(wchar_t letter);
@@ -66,6 +75,7 @@ private:
     std::vector<ElementInfo> elements_;
     std::vector<Scope> stack_;
     std::wstring prefix_;
+    HintOptions options_;
 };
 
 }  // namespace kbun

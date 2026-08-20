@@ -115,10 +115,39 @@ int main() {
         kbun::HintNavigator hints;
         hints.Reset(12, std::move(elements));
         const auto top = hints.Display();
+        Check(top.size() == 1 && top.front().isGroup,
+              "overlapping sections merge when their combined scope fits the alphabet");
+        hints.Input(top.front().code[0]);
+        Check(hints.Display().size() == 10,
+              "all targets from both overlapping sections remain in the merged scope");
+    }
+
+    {
+        std::vector<kbun::ElementInfo> elements;
+        const RECT outerBounds{0, 0, 900, 700};
+        const RECT innerBounds{300, 150, 700, 550};
+        for (std::uint64_t id = 1; id <= 20; ++id) {
+            elements.push_back(SectionElement(
+                id,
+                RECT{20, static_cast<LONG>(id * 28), 120, static_cast<LONG>(id * 28 + 20)},
+                30,
+                outerBounds));
+        }
+        for (std::uint64_t id = 1; id <= 10; ++id) {
+            elements.push_back(SectionElement(
+                id + 20,
+                RECT{360, static_cast<LONG>(id * 32 + 170), 480, static_cast<LONG>(id * 32 + 194)},
+                40,
+                innerBounds));
+        }
+
+        kbun::HintNavigator hints;
+        hints.Reset(14, std::move(elements));
+        const auto top = hints.Display();
         Check(std::ranges::count_if(top, [](const auto& hint) { return hint.isGroup; }) == 1,
-              "only the smaller overlapping section remains nested");
-        Check(std::ranges::count_if(top, [](const auto& hint) { return !hint.isGroup; }) == 5,
-              "the larger overlapping section is flattened to direct targets");
+              "the smaller section stays nested when merging would exceed 26 targets");
+        Check(std::ranges::count_if(top, [](const auto& hint) { return !hint.isGroup; }) == 20,
+              "the over-capacity parent falls back to direct targets");
     }
 
     {
@@ -141,6 +170,53 @@ int main() {
     }
 
     {
+        std::vector<kbun::ElementInfo> elements;
+        const RECT sectionBounds{100, 100, 400, 400};
+        for (std::uint64_t id = 1; id <= 5; ++id) {
+            elements.push_back(SectionElement(
+                id,
+                RECT{130, static_cast<LONG>(120 + id * 38), 260, static_cast<LONG>(146 + id * 38)},
+                50,
+                sectionBounds));
+        }
+        auto largerDirect = SectionElement(20, RECT{0, 0, 500, 500}, 0, {});
+        largerDirect.drawOutline = false;
+        elements.push_back(largerDirect);
+
+        kbun::HintNavigator hints;
+        hints.Reset(17, std::move(elements));
+        const auto top = hints.Display();
+        Check(top.size() == 1 && top.front().isGroup,
+              "a larger overlapping direct target is absorbed into the existing nested scope");
+        hints.Input(top.front().code[0]);
+        Check(hints.Display().size() == 6,
+              "the absorbed target remains selectable inside the one-step scope");
+    }
+
+    {
+        kbun::HintNavigator hints;
+        hints.Reset(
+            15,
+            {Element(1, 0, 0), Element(2, 100, 0), Element(3, 200, 0)},
+            kbun::HintOptions{false, L"AD"});
+        const auto shown = hints.Display();
+        Check(std::ranges::none_of(shown, [](const auto& hint) {
+            return hint.code.starts_with(L'A') || hint.code.starts_with(L'D');
+        }), "reserved filter letters are not assigned to top-level hints");
+    }
+
+    {
+        kbun::HintNavigator hints;
+        hints.Reset(
+            16,
+            {Element(1, 0, 0), Element(2, 100, 0), Element(3, 200, 0)},
+            kbun::HintOptions{true, {}});
+        const auto shown = hints.Display();
+        Check(std::ranges::all_of(shown, [](const auto& hint) { return hint.code.size() == 1; }),
+              "dropdown option mode assigns one-letter hints directly");
+    }
+
+    {
         const auto codexDocument = kbun::ClassifyTextRole(
             UIA_DocumentControlTypeId,
             true,
@@ -160,6 +236,21 @@ int main() {
             false);
         Check(editableDocument == kbun::ElementRole::EditableText,
               "range-level editability still identifies editable documents");
+    }
+
+    {
+        Check(kbun::ShouldDismissSelectionForKey(VK_F24, true, false, false),
+              "an unrelated physical key dismisses the selected outline");
+        Check(!kbun::ShouldDismissSelectionForKey(VK_F24, true, true, false),
+              "key repeat does not post repeated selection dismissals");
+        Check(!kbun::ShouldDismissSelectionForKey(VK_F24, false, true, false),
+              "key release does not dismiss a selection");
+        Check(!kbun::ShouldDismissSelectionForKey(VK_F24, true, false, true),
+              "KBUN's injected caret setup does not dismiss its own selection");
+        Check(!kbun::ShouldDismissSelectionForKey(VK_LSHIFT, true, false, false),
+              "Shift remains available for extending a read-only text selection");
+        Check(!kbun::ShouldDismissSelectionForKey(VK_LCONTROL, true, false, false),
+              "Control remains available for caret copy shortcuts");
     }
 
     std::cout << "KBUN hint tests passed\n";

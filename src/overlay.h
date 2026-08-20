@@ -1,5 +1,6 @@
 #pragma once
 
+#include "config.h"
 #include "hints.h"
 
 #include <windows.h>
@@ -21,8 +22,10 @@ public:
     void Destroy();
 
     void SetFadeDurations(UINT fadeInMs, UINT fadeOutMs);
+    void SetAppearance(const Config& config);
     void Begin();
     void ShowHints(const std::vector<DisplayHint>& hints);
+    void ShowSelection(const ElementInfo& element);
     void ShowCaret(const RECT& bounds);
     void HideCaret();
     void FadeOut();
@@ -39,6 +42,7 @@ private:
 
     bool RecreateSurface();
     void ReleaseSurface();
+    void RecreateFont();
     void PrepareSurfaceAlpha();
     void Render(const std::vector<DisplayHint>& hints);
     void Paint();
@@ -64,6 +68,11 @@ private:
     ULONGLONG fadeStartedAt_ = 0;
     UINT fadeInMs_ = 90;
     UINT fadeOutMs_ = 75;
+    GradientMode gradientMode_ = GradientMode::Rainbow;
+    std::vector<COLORREF> gradientColors_{RGB(0, 122, 255), RGB(255, 45, 85)};
+    COLORREF labelTextColor_ = RGB(255, 255, 255);
+    bool highContrastLabels_ = false;
+    UINT labelScalePercent_ = 100;
     bool shown_ = false;
 };
 

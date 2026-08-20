@@ -15,7 +15,6 @@ constexpr UINT_PTR kFadeTimer = 1;
 constexpr COLORREF kTransparentKey = RGB(1, 2, 3);
 constexpr COLORREF kDimOutline = RGB(88, 102, 110);
 constexpr COLORREF kVeilPixel = RGB(74, 78, 84);
-constexpr COLORREF kLabelText = RGB(255, 255, 255);
 constexpr COLORREF kLabelShadow = RGB(12, 16, 20);
 constexpr BYTE kVeilAlpha = 30;
 constexpr BYTE kShadowAlpha = 82;
@@ -60,14 +59,39 @@ COLORREF HsvColor(double hue, double saturation, double value) {
         static_cast<BYTE>(std::lround(blue * 255.0)));
 }
 
-COLORREF RainbowAt(POINT screenPoint, const RECT& virtualScreen) {
+COLORREF GradientAt(
+    POINT screenPoint,
+    const RECT& virtualScreen,
+    GradientMode mode,
+    const std::vector<COLORREF>& colors) {
     const double x = RectWidth(virtualScreen) > 0
         ? static_cast<double>(screenPoint.x - virtualScreen.left) / RectWidth(virtualScreen)
         : 0.0;
     const double y = RectHeight(virtualScreen) > 0
         ? static_cast<double>(screenPoint.y - virtualScreen.top) / RectHeight(virtualScreen)
         : 0.0;
-    return HsvColor(x * 0.86 + y * 0.14 + 0.92, 0.72, 1.0);
+    const double position = std::clamp(x * 0.86 + y * 0.14, 0.0, 1.0);
+    if (mode == GradientMode::Rainbow || colors.empty()) {
+        return HsvColor(position + 0.92, 0.72, 1.0);
+    }
+    if (colors.size() == 1) return colors.front();
+
+    const double scaled = position * static_cast<double>(colors.size() - 1);
+    const std::size_t index = std::min(colors.size() - 2, static_cast<std::size_t>(scaled));
+    const double blend = scaled - static_cast<double>(index);
+    const auto channel = [blend](BYTE from, BYTE to) {
+        return static_cast<BYTE>(std::lround(from + (to - from) * blend));
+    };
+    return RGB(
+        channel(GetRValue(colors[index]), GetRValue(colors[index + 1])),
+        channel(GetGValue(colors[index]), GetGValue(colors[index + 1])),
+        channel(GetBValue(colors[index]), GetBValue(colors[index + 1])));
+}
+
+COLORREF ContrastingText(COLORREF background) {
+    const double luminance = 0.2126 * GetRValue(background) +
+        0.7152 * GetGValue(background) + 0.0722 * GetBValue(background);
+    return luminance >= 150.0 ? RGB(12, 15, 18) : RGB(255, 255, 255);
 }
 
 bool PixelMatches(BYTE red, BYTE green, BYTE blue, COLORREF color) {
@@ -87,6 +111,8 @@ void DrawGradientLine(
     POINT end,
     POINT screenOffset,
     const RECT& virtualScreen,
+    GradientMode mode,
+    const std::vector<COLORREF>& colors,
     int thickness) {
     const int length = std::max(std::abs(end.x - start.x), std::abs(end.y - start.y));
     const int segments = std::clamp((length + 55) / 56, 1, 20);
@@ -107,7 +133,7 @@ void DrawGradientLine(
             screenOffset.x + (a.x + b.x) / 2,
             screenOffset.y + (a.y + b.y) / 2,
         };
-        LOGBRUSH brush{BS_SOLID, RainbowAt(sample, virtualScreen), 0};
+        LOGBRUSH brush{BS_SOLID, GradientAt(sample, virtualScreen, mode, colors), 0};
         HPEN segmentPen = ExtCreatePen(PS_GEOMETRIC | PS_SOLID | PS_ENDCAP_FLAT,
                                       thickness, &brush, 0, nullptr);
         SelectObject(dc, segmentPen);
@@ -125,10 +151,14 @@ void DrawRoundedOutline(
     const RECT& bounds,
     const RECT& virtualScreen,
     bool dimmed,
+    GradientMode mode,
+    const std::vector<COLORREF>& colors,
     int thickness) {
     const POINT localCenter = RectCenter(bounds);
     const POINT screenCenter{localCenter.x + virtualScreen.left, localCenter.y + virtualScreen.top};
-    const COLORREF accent = dimmed ? kDimOutline : RainbowAt(screenCenter, virtualScreen);
+    const COLORREF accent = dimmed
+        ? kDimOutline
+        : GradientAt(screenCenter, virtualScreen, mode, colors);
     const int radius = CornerRadius(bounds);
     HPEN pen = CreatePen(PS_SOLID, thickness, accent);
     HGDIOBJ previousPen = SelectObject(dc, pen);
@@ -142,15 +172,15 @@ void DrawRoundedOutline(
     const POINT screenOffset{virtualScreen.left, virtualScreen.top};
     if (RectWidth(bounds) > radius * 2 + 8) {
         DrawGradientLine(dc, {bounds.left + radius, bounds.top}, {bounds.right - radius, bounds.top},
-                         screenOffset, virtualScreen, thickness);
+                         screenOffset, virtualScreen, mode, colors, thickness);
         DrawGradientLine(dc, {bounds.left + radius, bounds.bottom - 1}, {bounds.right - radius, bounds.bottom - 1},
-                         screenOffset, virtualScreen, thickness);
+                         screenOffset, virtualScreen, mode, colors, thickness);
     }
     if (RectHeight(bounds) > radius * 2 + 8) {
         DrawGradientLine(dc, {bounds.left, bounds.top + radius}, {bounds.left, bounds.bottom - radius},
-                         screenOffset, virtualScreen, thickness);
+                         screenOffset, virtualScreen, mode, colors, thickness);
         DrawGradientLine(dc, {bounds.right - 1, bounds.top + radius}, {bounds.right - 1, bounds.bottom - radius},
-                         screenOffset, virtualScreen, thickness);
+                         screenOffset, virtualScreen, mode, colors, thickness);
     }
 }
 
@@ -159,6 +189,8 @@ void DrawBadgeGradient(
     const RECT& bounds,
     const RECT& virtualScreen,
     bool dimmed,
+    GradientMode mode,
+    const std::vector<COLORREF>& colors,
     int radius) {
     HRGN clip = CreateRoundRectRgn(
         bounds.left,
@@ -179,7 +211,9 @@ void DrawBadgeGradient(
             bounds.left + x + virtualScreen.left + sampleOffset,
             (bounds.top + bounds.bottom) / 2 + virtualScreen.top,
         };
-        const COLORREF color = dimmed ? kDimOutline : RainbowAt(sample, virtualScreen);
+        const COLORREF color = dimmed
+            ? kDimOutline
+            : GradientAt(sample, virtualScreen, mode, colors);
         SetDCPenColor(dc, color);
         MoveToEx(dc, bounds.left + x, bounds.top, nullptr);
         LineTo(dc, bounds.left + x, bounds.bottom);
@@ -275,6 +309,42 @@ void OverlayWindow::SetFadeDurations(UINT fadeInMs, UINT fadeOutMs) {
     fadeOutMs_ = fadeOutMs;
 }
 
+void OverlayWindow::SetAppearance(const Config& config) {
+    gradientMode_ = config.gradientMode;
+    gradientColors_ = config.gradientColors;
+    if (gradientColors_.empty()) gradientColors_.push_back(RGB(0, 122, 255));
+    if (gradientColors_.size() > kMaximumGradientColors) {
+        gradientColors_.resize(kMaximumGradientColors);
+    }
+    labelTextColor_ = config.labelTextColor;
+    highContrastLabels_ = config.highContrastLabels;
+    const UINT labelScale = std::clamp(config.labelScalePercent, 70U, 200U);
+    if (labelScalePercent_ != labelScale || !font_) {
+        labelScalePercent_ = labelScale;
+        RecreateFont();
+    }
+}
+
+void OverlayWindow::RecreateFont() {
+    if (font_) DeleteObject(font_);
+    const UINT dpi = GetDpiForSystem();
+    font_ = CreateFontW(
+        -MulDiv(9 * static_cast<int>(labelScalePercent_), static_cast<int>(dpi), 72 * 100),
+        0,
+        0,
+        0,
+        FW_BOLD,
+        FALSE,
+        FALSE,
+        FALSE,
+        DEFAULT_CHARSET,
+        OUT_DEFAULT_PRECIS,
+        CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY,
+        DEFAULT_PITCH | FF_DONTCARE,
+        L"Segoe UI Variable Text");
+}
+
 bool OverlayWindow::RecreateSurface() {
     ReleaseSurface();
     virtualScreen_ = RECT{
@@ -304,24 +374,7 @@ bool OverlayWindow::RecreateSurface() {
     if (!memoryDc_ || !bitmap_ || !bitmapPixels_) return false;
     previousBitmap_ = SelectObject(memoryDc_, bitmap_);
 
-    if (!font_) {
-        const UINT dpi = GetDpiForSystem();
-        font_ = CreateFontW(
-            -MulDiv(9, static_cast<int>(dpi), 72),
-            0,
-            0,
-            0,
-            FW_BOLD,
-            FALSE,
-            FALSE,
-            FALSE,
-            DEFAULT_CHARSET,
-            OUT_DEFAULT_PRECIS,
-            CLIP_DEFAULT_PRECIS,
-            CLEARTYPE_QUALITY,
-            DEFAULT_PITCH | FF_DONTCARE,
-            L"Segoe UI Variable Text");
-    }
+    if (!font_) RecreateFont();
     return true;
 }
 
@@ -377,12 +430,28 @@ void OverlayWindow::ShowHints(const std::vector<DisplayHint>& hints) {
     ApplyAlpha();
 }
 
+void OverlayWindow::ShowSelection(const ElementInfo& element) {
+    if (!window_ || !memoryDc_) return;
+    if (!shown_) Begin();
+    DisplayHint selected;
+    selected.bounds = element.bounds;
+    selected.role = element.role;
+    selected.drawOutline = element.drawOutline;
+    selected.showLabel = false;
+    Render({selected});
+    ApplyAlpha();
+}
+
 void OverlayWindow::ShowCaret(const RECT& bounds) {
     if (!caretWindow_ || RectHeight(bounds) <= 0) return;
     const int height = std::clamp(RectHeight(bounds), 12, 80);
     const int x = bounds.left - 3;
     const int y = bounds.top;
-    caretColor_ = RainbowAt({bounds.left, bounds.top + height / 2}, virtualScreen_);
+    caretColor_ = GradientAt(
+        {bounds.left, bounds.top + height / 2},
+        virtualScreen_,
+        gradientMode_,
+        gradientColors_);
     SetWindowPos(caretWindow_, HWND_TOPMOST, x, y, 7, height, SWP_NOACTIVATE | SWP_SHOWWINDOW);
     InvalidateRect(caretWindow_, nullptr, FALSE);
     UpdateWindow(caretWindow_);
@@ -532,8 +601,12 @@ void OverlayWindow::Render(const std::vector<DisplayHint>& hints) {
                 bounds,
                 virtualScreen_,
                 !hint.prefixMatch,
+                gradientMode_,
+                gradientColors_,
                 hint.isGroup ? 4 : 3);
         }
+
+        if (!hint.showLabel) continue;
 
         std::wstring code = hint.code;
         std::ranges::transform(code, code.begin(), [](wchar_t value) {
@@ -546,12 +619,17 @@ void OverlayWindow::Render(const std::vector<DisplayHint>& hints) {
             code.c_str(),
             static_cast<int>(code.size()),
             &textSize);
-        const bool textTarget = !hint.isGroup && hint.role != ElementRole::Action;
-        constexpr int horizontalPadding = 5;
-        constexpr int verticalPadding = 3;
-        constexpr int iconGap = 4;
-        constexpr int iconWidth = 7;
-        const int labelHeight = std::max(22, static_cast<int>(textSize.cy) + verticalPadding * 2);
+        const bool textTarget = !hint.isGroup && IsTextRole(hint.role);
+        const auto scaleMetric = [this](int value) {
+            return std::max(1, MulDiv(value, static_cast<int>(labelScalePercent_), 100));
+        };
+        const int horizontalPadding = std::max(3, scaleMetric(5));
+        const int verticalPadding = std::max(2, scaleMetric(3));
+        const int iconGap = std::max(2, scaleMetric(4));
+        const int iconWidth = std::max(5, scaleMetric(7));
+        const int labelHeight = std::max(
+            scaleMetric(22),
+            static_cast<int>(textSize.cy) + verticalPadding * 2);
         const int labelWidth = std::max(labelHeight, static_cast<int>(textSize.cx) + horizontalPadding * 2);
 
         const POINT center = RectCenter(bounds);
@@ -567,19 +645,28 @@ void OverlayWindow::Render(const std::vector<DisplayHint>& hints) {
         }
 
         const POINT labelScreenCenter{center.x + virtualScreen_.left, center.y + virtualScreen_.top};
-        const COLORREF accent = hint.prefixMatch ? RainbowAt(labelScreenCenter, virtualScreen_) : kDimOutline;
+        const COLORREF accent = hint.prefixMatch
+            ? GradientAt(labelScreenCenter, virtualScreen_, gradientMode_, gradientColors_)
+            : kDimOutline;
         RECT shadow = label;
         OffsetRect(&shadow, 1, 2);
         HBRUSH shadowBrush = CreateSolidBrush(kLabelShadow);
         previousPen = SelectObject(memoryDc_, GetStockObject(NULL_PEN));
         previousBrush = SelectObject(memoryDc_, shadowBrush);
-        constexpr int badgeRadius = 5;
+        const int badgeRadius = std::max(3, scaleMetric(5));
         RoundRect(memoryDc_, shadow.left, shadow.top, shadow.right, shadow.bottom,
                   badgeRadius * 2, badgeRadius * 2);
         SelectObject(memoryDc_, previousBrush);
         DeleteObject(shadowBrush);
 
-        DrawBadgeGradient(memoryDc_, label, virtualScreen_, !hint.prefixMatch, badgeRadius);
+        DrawBadgeGradient(
+            memoryDc_,
+            label,
+            virtualScreen_,
+            !hint.prefixMatch,
+            gradientMode_,
+            gradientColors_,
+            badgeRadius);
         HPEN badgeBorder = CreatePen(PS_SOLID, 1, accent);
         previousPen = SelectObject(memoryDc_, badgeBorder);
         previousBrush = SelectObject(memoryDc_, GetStockObject(HOLLOW_BRUSH));
@@ -590,7 +677,8 @@ void OverlayWindow::Render(const std::vector<DisplayHint>& hints) {
         DeleteObject(badgeBorder);
 
         RECT textBounds = label;
-        SetTextColor(memoryDc_, kLabelText);
+        const COLORREF labelText = highContrastLabels_ ? ContrastingText(accent) : labelTextColor_;
+        SetTextColor(memoryDc_, labelText);
         DrawTextW(
             memoryDc_,
             code.c_str(),
@@ -601,9 +689,10 @@ void OverlayWindow::Render(const std::vector<DisplayHint>& hints) {
         if (textTarget) {
             const int iconLeft = label.right + iconGap;
             const int iconCenter = iconLeft + iconWidth / 2;
-            const int iconTop = label.top + 4;
-            const int iconBottom = label.bottom - 4;
-            HPEN iconHalo = CreatePen(PS_SOLID, 3, kLabelShadow);
+            const int iconInset = std::max(2, scaleMetric(4));
+            const int iconTop = label.top + iconInset;
+            const int iconBottom = label.bottom - iconInset;
+            HPEN iconHalo = CreatePen(PS_SOLID, std::max(2, scaleMetric(3)), kLabelShadow);
             HGDIOBJ oldPen = SelectObject(memoryDc_, iconHalo);
             MoveToEx(memoryDc_, iconCenter, iconTop, nullptr);
             LineTo(memoryDc_, iconCenter, iconBottom + 1);
@@ -614,7 +703,7 @@ void OverlayWindow::Render(const std::vector<DisplayHint>& hints) {
             SelectObject(memoryDc_, oldPen);
             DeleteObject(iconHalo);
 
-            HPEN iconPen = CreatePen(PS_SOLID, 1, kLabelText);
+            HPEN iconPen = CreatePen(PS_SOLID, 1, labelText);
             oldPen = SelectObject(memoryDc_, iconPen);
             MoveToEx(memoryDc_, iconCenter, iconTop, nullptr);
             LineTo(memoryDc_, iconCenter, iconBottom + 1);

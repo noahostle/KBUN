@@ -32,6 +32,8 @@ endif()
 
 target_link_libraries(KBUN PRIVATE
     advapi32
+    comdlg32
+    comctl32
     dwmapi
     gdi32
     ole32

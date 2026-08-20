@@ -66,6 +66,8 @@ struct AutomationState {
     ComPtr<IUIAutomationTextRange> anchorRange;
     ComPtr<IUIAutomationTextRange> caretRange;
     RECT caretFallbackBounds{};
+    std::uint64_t caretGeneration = 0;
+    std::uint64_t caretElementId = 0;
 };
 
 bool IsTaskbarWindow(HWND window) {
@@ -139,7 +141,14 @@ bool ElementCenterIsVisible(
     const std::vector<WindowCandidate>& windows,
     std::size_t ownerIndex) {
     if (RectArea(bounds) <= 0) return false;
-    return PointIsUnoccluded(RectCenter(bounds), windows, ownerIndex);
+    const POINT center = RectCenter(bounds);
+    const RECT virtualScreen{
+        GetSystemMetrics(SM_XVIRTUALSCREEN),
+        GetSystemMetrics(SM_YVIRTUALSCREEN),
+        GetSystemMetrics(SM_XVIRTUALSCREEN) + GetSystemMetrics(SM_CXVIRTUALSCREEN),
+        GetSystemMetrics(SM_YVIRTUALSCREEN) + GetSystemMetrics(SM_CYVIRTUALSCREEN),
+    };
+    return ContainsPoint(virtualScreen, center) && PointIsUnoccluded(center, windows, ownerIndex);
 }
 
 bool WindowHasVisibleRegion(const std::vector<WindowCandidate>& windows, std::size_t ownerIndex) {
@@ -160,6 +169,101 @@ bool WindowHasVisibleRegion(const std::vector<WindowCandidate>& windows, std::si
     return true;
 }
 
+bool SendControlMessage(
+    HWND window,
+    UINT message,
+    WPARAM wParam,
+    LPARAM lParam,
+    DWORD_PTR& result) {
+    return SendMessageTimeoutW(
+               window,
+               message,
+               wParam,
+               lParam,
+               SMTO_ABORTIFHUNG | SMTO_BLOCK,
+               120,
+               &result) != 0;
+}
+
+struct NativeComboLookup {
+    HWND list = nullptr;
+    HWND combo = nullptr;
+};
+
+BOOL CALLBACK FindComboChild(HWND window, LPARAM parameter) {
+    auto& lookup = *reinterpret_cast<NativeComboLookup*>(parameter);
+    wchar_t className[32]{};
+    GetClassNameW(window, className, static_cast<int>(std::size(className)));
+    if (_wcsicmp(className, L"ComboBox") != 0) return TRUE;
+
+    COMBOBOXINFO info{};
+    info.cbSize = sizeof(info);
+    if (GetComboBoxInfo(window, &info) && info.hwndList == lookup.list) {
+        lookup.combo = window;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+BOOL CALLBACK FindComboTopLevel(HWND window, LPARAM parameter) {
+    auto& lookup = *reinterpret_cast<NativeComboLookup*>(parameter);
+    if (!FindComboChild(window, parameter)) return FALSE;
+    EnumChildWindows(window, FindComboChild, parameter);
+    return lookup.combo == nullptr;
+}
+
+HWND FindComboForList(HWND list) {
+    NativeComboLookup lookup{list};
+    const DWORD thread = GetWindowThreadProcessId(list, nullptr);
+    if (thread != 0) EnumThreadWindows(thread, FindComboTopLevel, reinterpret_cast<LPARAM>(&lookup));
+    return lookup.combo;
+}
+
+void CollectNativeComboOptions(
+    const std::vector<WindowCandidate>& windows,
+    std::size_t windowIndex,
+    std::vector<RawElement>& allElements) {
+    const WindowCandidate& window = windows[windowIndex];
+    DWORD_PTR countResult = 0;
+    if (!SendControlMessage(window.handle, LB_GETCOUNT, 0, 0, countResult)) return;
+    const LRESULT count = static_cast<LRESULT>(countResult);
+    if (count <= 0 || count > 512) return;
+    const HWND combo = FindComboForList(window.handle);
+
+    for (LRESULT index = 0; index < count; ++index) {
+        RECT itemBounds{};
+        DWORD_PTR itemResult = 0;
+        const bool received = SendControlMessage(
+                window.handle,
+                LB_GETITEMRECT,
+                static_cast<WPARAM>(index),
+                reinterpret_cast<LPARAM>(&itemBounds),
+                itemResult);
+        if (!received ||
+            static_cast<LRESULT>(itemResult) == LB_ERR) {
+            continue;
+        }
+
+        POINT corners[2]{{itemBounds.left, itemBounds.top}, {itemBounds.right, itemBounds.bottom}};
+        MapWindowPoints(window.handle, nullptr, corners, 2);
+        RECT screenBounds{corners[0].x, corners[0].y, corners[1].x, corners[1].y};
+        RECT visibleBounds{};
+        if (!IntersectRect(&visibleBounds, &screenBounds, &window.bounds) ||
+            RectArea(visibleBounds) == 0) {
+            continue;
+        }
+
+        RawElement raw;
+        raw.info.ownerWindow = combo ? combo : window.handle;
+        raw.info.bounds = visibleBounds;
+        raw.info.role = ElementRole::Option;
+        raw.info.name = L"Option " + std::to_wstring(index + 1);
+        raw.ownerWindow = window.handle;
+        raw.controlType = UIA_ListItemControlTypeId;
+        allElements.push_back(std::move(raw));
+    }
+}
+
 bool VariantBool(IUIAutomationElement* element, PROPERTYID property, bool fallback = false) {
     VARIANT value;
     VariantInit(&value);
@@ -174,19 +278,13 @@ bool IsActionControl(CONTROLTYPEID type, bool hasInvokePattern) {
         case UIA_ButtonControlTypeId:
         case UIA_CalendarControlTypeId:
         case UIA_CheckBoxControlTypeId:
-        case UIA_ComboBoxControlTypeId:
         case UIA_DataItemControlTypeId:
         case UIA_HeaderItemControlTypeId:
         case UIA_HyperlinkControlTypeId:
-        case UIA_ListItemControlTypeId:
-        case UIA_MenuItemControlTypeId:
         case UIA_RadioButtonControlTypeId:
-        case UIA_ScrollBarControlTypeId:
         case UIA_SliderControlTypeId:
         case UIA_SpinnerControlTypeId:
-        case UIA_SplitButtonControlTypeId:
         case UIA_TabItemControlTypeId:
-        case UIA_ThumbControlTypeId:
         case UIA_TreeItemControlTypeId:
             return true;
         case UIA_CustomControlTypeId:
@@ -244,7 +342,21 @@ ElementRole ClassifyElement(
     bool valueReadOnly,
     std::optional<bool> textRangeEditable,
     bool isPassword,
-    bool hasInvokePattern) {
+    bool hasInvokePattern,
+    bool hasExpandCollapsePattern,
+    bool nativeComboBox) {
+    if (nativeComboBox || type == UIA_ComboBoxControlTypeId || type == UIA_SplitButtonControlTypeId ||
+        (hasExpandCollapsePattern &&
+         (type == UIA_ButtonControlTypeId || type == UIA_CustomControlTypeId))) {
+        return ElementRole::DropDown;
+    }
+    if (type == UIA_ListItemControlTypeId || type == UIA_MenuItemControlTypeId) {
+        return ElementRole::Option;
+    }
+    if (type == UIA_HyperlinkControlTypeId ||
+        (hasInvokePattern && (type == UIA_TextControlTypeId || type == UIA_CustomControlTypeId))) {
+        return ElementRole::Action;
+    }
     if (const auto textRole = ClassifyTextRole(
             type,
             hasTextPattern,
@@ -260,8 +372,10 @@ ElementRole ClassifyElement(
 
 int RolePriority(ElementRole role) {
     switch (role) {
-        case ElementRole::EditableText: return 3;
-        case ElementRole::ReadOnlyText: return 2;
+        case ElementRole::EditableText: return 5;
+        case ElementRole::ReadOnlyText: return 4;
+        case ElementRole::DropDown: return 3;
+        case ElementRole::Option: return 2;
         case ElementRole::Action: return 1;
     }
     return 0;
@@ -283,11 +397,19 @@ std::wstring CachedName(IUIAutomationElement* element) {
     return result;
 }
 
+std::wstring CachedClassName(IUIAutomationElement* element) {
+    BSTR value = nullptr;
+    if (FAILED(element->get_CachedClassName(&value)) || value == nullptr) return {};
+    std::wstring result(value, SysStringLen(value));
+    SysFreeString(value);
+    return result;
+}
+
 bool ConfigureCache(AutomationState& state) {
     if (FAILED(state.automation->get_ControlViewCondition(state.controlViewCondition.Put()))) return false;
     if (FAILED(state.automation->CreateCacheRequest(state.cacheRequest.Put()))) return false;
 
-    const std::array<PROPERTYID, 11> properties{
+    const std::array<PROPERTYID, 13> properties{
         UIA_BoundingRectanglePropertyId,
         UIA_ControlTypePropertyId,
         UIA_IsEnabledPropertyId,
@@ -295,7 +417,9 @@ bool ConfigureCache(AutomationState& state) {
         UIA_IsPasswordPropertyId,
         UIA_IsKeyboardFocusablePropertyId,
         UIA_NamePropertyId,
+        UIA_ClassNamePropertyId,
         UIA_IsInvokePatternAvailablePropertyId,
+        UIA_IsExpandCollapsePatternAvailablePropertyId,
         UIA_IsTextPatternAvailablePropertyId,
         UIA_IsValuePatternAvailablePropertyId,
         UIA_ValueIsReadOnlyPropertyId,
@@ -383,6 +507,12 @@ void CollectWindowElements(
     std::size_t windowIndex,
     std::vector<RawElement>& allElements) {
     const WindowCandidate& window = windows[windowIndex];
+    wchar_t windowClass[64]{};
+    GetClassNameW(window.handle, windowClass, static_cast<int>(std::size(windowClass)));
+    if (_wcsicmp(windowClass, L"ComboLBox") == 0) {
+        CollectNativeComboOptions(windows, windowIndex, allElements);
+        return;
+    }
     if (!WindowHasVisibleRegion(windows, windowIndex)) return;
     ComPtr<IUIAutomationElement> root;
     if (FAILED(state.automation->ElementFromHandle(window.handle, root.Put())) || !root) return;
@@ -402,6 +532,7 @@ void CollectWindowElements(
 
     std::vector<RawElement> windowElements;
     std::vector<SectionCandidate> sections;
+    std::vector<RECT> scrollBars;
     windowElements.reserve(static_cast<std::size_t>(length) / 2);
     sections.reserve(32);
 
@@ -424,11 +555,21 @@ void CollectWindowElements(
         RECT onWindow{};
         if (!IntersectRect(&onWindow, &bounds, &window.bounds) || RectArea(onWindow) == 0) continue;
 
+        const std::wstring className = CachedClassName(element.Get());
+        const bool nativeComboBox = _wcsicmp(className.c_str(), L"ComboBox") == 0;
+        const bool nativeScrollBar = _wcsicmp(className.c_str(), L"ScrollBar") == 0;
+        if (controlType == UIA_ScrollBarControlTypeId || nativeScrollBar) {
+            scrollBars.push_back(bounds);
+            continue;
+        }
+
         if (IsSectionControl(controlType)) sections.push_back({bounds, controlType});
 
         const bool hasTextPattern = VariantBool(element.Get(), UIA_IsTextPatternAvailablePropertyId);
         const bool hasValuePattern = VariantBool(element.Get(), UIA_IsValuePatternAvailablePropertyId);
         const bool hasInvokePattern = VariantBool(element.Get(), UIA_IsInvokePatternAvailablePropertyId);
+        const bool hasExpandCollapsePattern =
+            VariantBool(element.Get(), UIA_IsExpandCollapsePatternAvailablePropertyId);
         const bool valueReadOnly = VariantBool(element.Get(), UIA_ValueIsReadOnlyPropertyId, true);
         const std::optional<bool> textRangeEditable =
             (controlType == UIA_EditControlTypeId ||
@@ -446,7 +587,9 @@ void CollectWindowElements(
             valueReadOnly,
             textRangeEditable,
             isPasswordValue != FALSE,
-            hasInvokePattern);
+            hasInvokePattern,
+            hasExpandCollapsePattern,
+            nativeComboBox);
         if (static_cast<unsigned>(role) == 255U) continue;
         if (!ElementCenterIsVisible(bounds, windows, windowIndex)) continue;
 
@@ -465,10 +608,19 @@ void CollectWindowElements(
         windowElements.push_back(std::move(raw));
     }
 
-    // A document or edit is the single text target for the text nodes it geometrically owns.
+    std::erase_if(windowElements, [&scrollBars](const RawElement& candidate) {
+        return std::ranges::any_of(scrollBars, [&candidate](const RECT& scrollBar) {
+            return ContainsPoint(scrollBar, RectCenter(candidate.info.bounds));
+        });
+    });
+
+    // Writable documents and edits are atomic fields. Read-only documents yield
+    // to smaller text ranges so caret browsing stays inside the chosen field.
     std::vector<RECT> textContainers;
     for (const RawElement& element : windowElements) {
-        if (element.controlType == UIA_DocumentControlTypeId || element.controlType == UIA_EditControlTypeId) {
+        if (element.controlType == UIA_EditControlTypeId ||
+            (element.controlType == UIA_DocumentControlTypeId &&
+             element.info.role == ElementRole::EditableText)) {
             textContainers.push_back(element.info.bounds);
         }
     }
@@ -479,6 +631,21 @@ void CollectWindowElements(
         return std::ranges::any_of(textContainers, [&candidate](const RECT& container) {
             return RectArea(container) > RectArea(candidate.info.bounds) * 12 / 10 &&
                    ContainsPoint(container, RectCenter(candidate.info.bounds));
+        });
+    });
+
+    std::vector<RECT> specificTextBounds;
+    for (const RawElement& element : windowElements) {
+        if (IsTextRole(element.info.role)) specificTextBounds.push_back(element.info.bounds);
+    }
+    std::erase_if(windowElements, [&specificTextBounds](const RawElement& candidate) {
+        if (candidate.controlType != UIA_DocumentControlTypeId ||
+            candidate.info.role != ElementRole::ReadOnlyText) {
+            return false;
+        }
+        return std::ranges::any_of(specificTextBounds, [&candidate](const RECT& inner) {
+            return RectArea(candidate.info.bounds) > RectArea(inner) * 12 / 10 &&
+                   ContainsPoint(candidate.info.bounds, RectCenter(inner));
         });
     });
 
@@ -502,8 +669,8 @@ void Deduplicate(std::vector<RawElement>& elements) {
             const double overlap = IntersectionOverUnion(candidate.info.bounds, existing.info.bounds);
             if (overlap < 0.88) return false;
             return candidate.info.role == existing.info.role ||
-                   candidate.info.role != ElementRole::Action ||
-                   existing.info.role != ElementRole::Action;
+                   IsTextRole(candidate.info.role) || IsTextRole(existing.info.role) ||
+                   (IsButtonRole(candidate.info.role) && IsButtonRole(existing.info.role));
         });
         if (!duplicate) unique.push_back(std::move(candidate));
     }
@@ -558,6 +725,41 @@ ComPtr<IUIAutomationTextRange> CloneRange(IUIAutomationTextRange* range) {
     return result;
 }
 
+struct TextProvider {
+    ComPtr<IUIAutomationElement> element;
+    ComPtr<IUIAutomationTextPattern> pattern;
+    bool isSelectedElement = false;
+};
+
+TextProvider FindNearestTextProvider(
+    AutomationState& state,
+    IUIAutomationElement* selectedElement) {
+    TextProvider result;
+    if (!selectedElement) return result;
+
+    ComPtr<IUIAutomationTreeWalker> walker;
+    state.automation->get_ControlViewWalker(walker.Put());
+    ComPtr<IUIAutomationElement> current(selectedElement);
+    for (int depth = 0; current && depth < 16; ++depth) {
+        ComPtr<IUIAutomationTextPattern> pattern;
+        if (SUCCEEDED(current->GetCurrentPatternAs(
+                UIA_TextPatternId,
+                IID_IUIAutomationTextPattern,
+                pattern.PutVoid())) &&
+            pattern) {
+            result.element = std::move(current);
+            result.pattern = std::move(pattern);
+            result.isSelectedElement = depth == 0;
+            return result;
+        }
+        if (!walker) break;
+        ComPtr<IUIAutomationElement> parent;
+        if (FAILED(walker->GetParentElement(current.Get(), parent.Put())) || !parent) break;
+        current = std::move(parent);
+    }
+    return result;
+}
+
 void PlaceEditableCaret(IUIAutomationElement* element) {
     RECT bounds{};
     if (element && SUCCEEDED(element->get_CurrentBoundingRectangle(&bounds)) && RectArea(bounds) > 0) {
@@ -587,6 +789,92 @@ void CollapseTo(IUIAutomationTextRange* range, TextPatternRangeEndpoint endpoint
     } else {
         range->MoveEndpointByRange(TextPatternRangeEndpoint_Start, range, TextPatternRangeEndpoint_End);
     }
+}
+
+ComPtr<IUIAutomationTextRange> BoundRangeToElement(
+    IUIAutomationTextPattern* pattern,
+    IUIAutomationTextRange* document,
+    IUIAutomationElement* selectedElement,
+    bool selectedOwnsPattern,
+    const RECT& bounds) {
+    if (!pattern || !document || RectArea(bounds) <= 0) return {};
+    if (selectedOwnsPattern) return CloneRange(document);
+
+    ComPtr<IUIAutomationTextRange> childRange;
+    if (selectedElement &&
+        SUCCEEDED(pattern->RangeFromChild(selectedElement, childRange.Put())) &&
+        childRange) {
+        return childRange;
+    }
+
+    const LONG horizontalInset = std::min<LONG>(8, std::max<LONG>(1, RectWidth(bounds) / 4));
+    const LONG verticalInset = std::min<LONG>(8, std::max<LONG>(1, RectHeight(bounds) / 4));
+    const POINT startPoint{bounds.left + horizontalInset, bounds.top + verticalInset};
+    const POINT endPoint{bounds.right - horizontalInset, bounds.bottom - verticalInset};
+
+    ComPtr<IUIAutomationTextRange> start;
+    ComPtr<IUIAutomationTextRange> end;
+    if (FAILED(pattern->RangeFromPoint(startPoint, start.Put())) || !start ||
+        FAILED(pattern->RangeFromPoint(endPoint, end.Put())) || !end) {
+        return {};
+    }
+
+    int order = 0;
+    if (FAILED(start->CompareEndpoints(
+            TextPatternRangeEndpoint_Start,
+            end.Get(),
+            TextPatternRangeEndpoint_Start,
+            &order))) {
+        return {};
+    }
+    if (order > 0) start.Swap(end);
+
+    ComPtr<IUIAutomationTextRange> bounded = CloneRange(start.Get());
+    if (!bounded || FAILED(bounded->MoveEndpointByRange(
+            TextPatternRangeEndpoint_End,
+            end.Get(),
+            TextPatternRangeEndpoint_Start))) {
+        return {};
+    }
+    if (order == 0) bounded->ExpandToEnclosingUnit(TextUnit_Character);
+    return bounded;
+}
+
+void ClampCaretToDocument(AutomationState& state) {
+    if (!state.caretRange || !state.documentRange) return;
+
+    int comparison = 0;
+    if (SUCCEEDED(state.caretRange->CompareEndpoints(
+            TextPatternRangeEndpoint_Start,
+            state.documentRange.Get(),
+            TextPatternRangeEndpoint_Start,
+            &comparison)) && comparison < 0) {
+        state.caretRange->MoveEndpointByRange(
+            TextPatternRangeEndpoint_Start,
+            state.documentRange.Get(),
+            TextPatternRangeEndpoint_Start);
+        CollapseTo(state.caretRange.Get(), TextPatternRangeEndpoint_Start);
+        return;
+    }
+
+    if (SUCCEEDED(state.caretRange->CompareEndpoints(
+            TextPatternRangeEndpoint_Start,
+            state.documentRange.Get(),
+            TextPatternRangeEndpoint_End,
+            &comparison)) && comparison > 0) {
+        state.caretRange->MoveEndpointByRange(
+            TextPatternRangeEndpoint_Start,
+            state.documentRange.Get(),
+            TextPatternRangeEndpoint_End);
+        CollapseTo(state.caretRange.Get(), TextPatternRangeEndpoint_Start);
+    }
+}
+
+void CollapseVisibleSelection(AutomationState& state) {
+    ComPtr<IUIAutomationTextRange> collapsed = CloneRange(state.caretRange.Get());
+    if (!collapsed) return;
+    CollapseTo(collapsed.Get(), TextPatternRangeEndpoint_Start);
+    collapsed->Select();
 }
 
 ComPtr<IUIAutomationTextRange> OrderedSelection(AutomationState& state) {
@@ -671,6 +959,8 @@ void ClearCaret(AutomationState& state) {
     state.documentRange.Reset();
     state.caretElement.Reset();
     state.caretFallbackBounds = {};
+    state.caretGeneration = 0;
+    state.caretElementId = 0;
 }
 
 std::optional<RECT> CurrentCaretBounds(AutomationState& state) {
@@ -730,6 +1020,8 @@ std::optional<RECT> CurrentCaretBounds(AutomationState& state) {
 
 void PostCaretVisual(HWND replyWindow, AutomationState& state, bool visible) {
     auto* result = new CaretVisualResult;
+    result->generation = state.caretGeneration;
+    result->elementId = state.caretElementId;
     if (visible) {
         const std::optional<RECT> bounds = CurrentCaretBounds(state);
         if (bounds) {
@@ -778,6 +1070,7 @@ bool MoveToBoundary(AutomationState& state, bool end, TextUnit unit) {
 
 void HandleCaretInput(AutomationState& state, const CaretInput& input) {
     if (input.action == CaretAction::Exit) {
+        CollapseVisibleSelection(state);
         ClearCaret(state);
         return;
     }
@@ -823,9 +1116,64 @@ void HandleCaretInput(AutomationState& state, const CaretInput& input) {
         if (count != 0 && SUCCEEDED(state.caretRange->Move(unit, count, &actual))) moved = actual != 0;
     }
 
+    ClampCaretToDocument(state);
     if (moved && !input.extend) state.anchorRange = CloneRange(state.caretRange.Get());
     ApplyCaretSelection(state);
     state.caretRange->ScrollIntoView(FALSE);
+}
+
+bool OpenDropDown(IUIAutomationElement* element) {
+    if (!element) return false;
+
+    ComPtr<IUIAutomationExpandCollapsePattern> expandCollapse;
+    if (SUCCEEDED(element->GetCurrentPatternAs(
+            UIA_ExpandCollapsePatternId,
+            IID_IUIAutomationExpandCollapsePattern,
+            expandCollapse.PutVoid())) &&
+        expandCollapse) {
+        ExpandCollapseState state = ExpandCollapseState_Collapsed;
+        if (SUCCEEDED(expandCollapse->get_CurrentExpandCollapseState(&state)) &&
+            state == ExpandCollapseState_Expanded) {
+            return true;
+        }
+        if (SUCCEEDED(expandCollapse->Expand())) return true;
+    }
+
+    UIA_HWND nativeWindow = nullptr;
+    if (SUCCEEDED(element->get_CurrentNativeWindowHandle(&nativeWindow)) && nativeWindow) {
+        wchar_t className[32]{};
+        HWND window = static_cast<HWND>(nativeWindow);
+        if (GetClassNameW(window, className, static_cast<int>(std::size(className))) > 0 &&
+            _wcsicmp(className, L"ComboBox") == 0) {
+            DWORD_PTR ignored = 0;
+            if (SendMessageTimeoutW(
+                    window,
+                    CB_SHOWDROPDOWN,
+                    TRUE,
+                    0,
+                    SMTO_ABORTIFHUNG | SMTO_BLOCK,
+                    150,
+                    &ignored)) {
+                return true;
+            }
+        }
+    }
+
+    ComPtr<IUIAutomationInvokePattern> invoke;
+    if (SUCCEEDED(element->GetCurrentPatternAs(
+            UIA_InvokePatternId,
+            IID_IUIAutomationInvokePattern,
+            invoke.PutVoid())) &&
+        invoke && SUCCEEDED(invoke->Invoke())) {
+        return true;
+    }
+
+    ComPtr<IUIAutomationLegacyIAccessiblePattern> legacy;
+    return SUCCEEDED(element->GetCurrentPatternAs(
+               UIA_LegacyIAccessiblePatternId,
+               IID_IUIAutomationLegacyIAccessiblePattern,
+               legacy.PutVoid())) &&
+           legacy && SUCCEEDED(legacy->DoDefaultAction());
 }
 
 ActivationResult* ActivateElement(
@@ -838,7 +1186,12 @@ ActivationResult* ActivateElement(
 
     StoredElement* stored = FindStoredElement(state, generation, elementId);
     if (!stored || !stored->automationElement) return result;
-    if (stored->role == ElementRole::Action) {
+    if (stored->role == ElementRole::DropDown) {
+        result->mode = ActivationMode::Pointer;
+        result->succeeded = OpenDropDown(stored->automationElement.Get());
+        return result;
+    }
+    if (IsButtonRole(stored->role)) {
         result->mode = ActivationMode::Pointer;
         result->succeeded = true;
         return result;
@@ -849,22 +1202,40 @@ ActivationResult* ActivateElement(
     if (stored->role == ElementRole::ReadOnlyText) {
         state.caretElement = stored->automationElement;
         state.caretFallbackBounds = stored->bounds;
+        state.caretGeneration = generation;
+        state.caretElementId = elementId;
     }
     ComPtr<IUIAutomationTextPattern> textPattern;
-    const HRESULT patternResult = stored->automationElement->GetCurrentPatternAs(
-        UIA_TextPatternId,
-        IID_IUIAutomationTextPattern,
-        textPattern.PutVoid());
+    bool selectedOwnsPattern = true;
+    if (stored->role == ElementRole::ReadOnlyText) {
+        TextProvider provider = FindNearestTextProvider(state, stored->automationElement.Get());
+        textPattern = std::move(provider.pattern);
+        selectedOwnsPattern = provider.isSelectedElement;
+    } else {
+        stored->automationElement->GetCurrentPatternAs(
+            UIA_TextPatternId,
+            IID_IUIAutomationTextPattern,
+            textPattern.PutVoid());
+    }
 
     ComPtr<IUIAutomationTextRange> document;
-    if (SUCCEEDED(patternResult) && textPattern) textPattern->get_DocumentRange(document.Put());
+    if (textPattern) textPattern->get_DocumentRange(document.Put());
     if (document) {
-        ComPtr<IUIAutomationTextRange> start = CloneRange(document.Get());
-        CollapseTo(start.Get(), TextPatternRangeEndpoint_Start);
-        const HRESULT selectResult = start ? start->Select() : E_FAIL;
-
         if (stored->role == ElementRole::ReadOnlyText) {
-            state.documentRange = std::move(document);
+            state.documentRange = BoundRangeToElement(
+                textPattern.Get(),
+                document.Get(),
+                stored->automationElement.Get(),
+                selectedOwnsPattern,
+                stored->bounds);
+            if (!state.documentRange) {
+                result->mode = ActivationMode::Caret;
+                result->succeeded = true;
+                return result;
+            }
+            ComPtr<IUIAutomationTextRange> start = CloneRange(state.documentRange.Get());
+            CollapseTo(start.Get(), TextPatternRangeEndpoint_Start);
+            if (start) start->Select();
             state.anchorRange = CloneRange(start.Get());
             state.caretRange = std::move(start);
             result->mode = ActivationMode::Caret;
@@ -872,6 +1243,9 @@ ActivationResult* ActivateElement(
             return result;
         }
 
+        ComPtr<IUIAutomationTextRange> start = CloneRange(document.Get());
+        CollapseTo(start.Get(), TextPatternRangeEndpoint_Start);
+        const HRESULT selectResult = start ? start->Select() : E_FAIL;
         result->mode = ActivationMode::Editable;
         result->succeeded = SUCCEEDED(focusResult) || SUCCEEDED(selectResult);
         if (result->succeeded) PlaceEditableCaret(stored->automationElement.Get());
